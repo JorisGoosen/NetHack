@@ -9,6 +9,12 @@
  * implemented here.  This file owns the 3DS: console rendering, hid input,
  * the software keyboard, and the process lifecycle.
  *
+ * Phase 2b: hid input.  D-pad/circle-pad = hjkl (two held = diagonals,
+ * L/R+direction = run), A='.' rest, B='i', X=',', Y='s', START='S',
+ * SELECT='?'; yn prompts answer via buttons (B = no/esc, A = default).
+ * Without any button press the stub keeps auto-playing forced rests so
+ * unattended emulator runs still progress (demo mode).
+ *
  * Phase 2a: console rendering.  The top screen (50x30 with the 8x8 font)
  * shows the message area (3 rows), the map viewport (21 rows x 50 cols,
  * horizontally scrolled via cliparound), a field-driven 2-row status bar
@@ -440,7 +446,7 @@ static const char *const nh3ds_legend[TOP_ROWS - LEG_ROW0] = {
     "pad=hjkl two=diag L/R=run",
     "A=rest B=inv X=grab Y=search",
     "START=save SELECT=help",
-    "NetHack 3DS -- phase 2a",
+    "NetHack 3DS -- phase 2b",
 };
 
 static void
@@ -594,6 +600,107 @@ nh3ds_st_init(void)
         nh3ds_st_active[i] = TRUE;
         nh3ds_st_val[i][0] = '\0';
         nh3ds_st_color[i] = -1;
+    }
+}
+
+/* ----------------------------------------------------------------------*/
+/* hid input (phase 2b)                                                   */
+/* ----------------------------------------------------------------------*/
+
+static boolean nh3ds_demo_toggle; /* canned m/. alternation in demo mode */
+
+/* Button mapping (sys/3ds/PLAN.md "UI design"):
+ *   d-pad / circle pad  hjkl (two held = diagonals yubn), L/R+dir = run
+ *   A '.' rest          B 'i' inventory      X ',' pick up
+ *   Y 's' search        START 'S' save       SELECT '?' help
+ * Directions and A auto-repeat while held; the rest are edge-triggered.
+ */
+static int
+nh3ds_next_key(void) /* 0 = nothing to report this frame */
+{
+    static int last_key;
+    static u32 last_mask;
+    static int frames_since;
+    u32 held, btns, dir;
+    int key = 0;
+    boolean repeatable = FALSE;
+
+    hidScanInput();
+    gspWaitForVBlank();
+    held = hidKeysHeld(); /* KEY_UP.. include the circle pad */
+    btns = held & (KEY_A | KEY_B | KEY_X | KEY_Y | KEY_START | KEY_SELECT);
+    dir = held & (KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT);
+
+    if (dir) {
+        if ((dir & KEY_UP) && (dir & KEY_LEFT))
+            key = 'y';
+        else if ((dir & KEY_UP) && (dir & KEY_RIGHT))
+            key = 'u';
+        else if ((dir & KEY_DOWN) && (dir & KEY_LEFT))
+            key = 'b';
+        else if ((dir & KEY_DOWN) && (dir & KEY_RIGHT))
+            key = 'n';
+        else if (dir & KEY_LEFT)
+            key = 'h';
+        else if (dir & KEY_RIGHT)
+            key = 'l';
+        else if (dir & KEY_UP)
+            key = 'k';
+        else
+            key = 'j';
+        if (held & (KEY_L | KEY_R))
+            key = key - 'a' + 'A'; /* run: HJKL / YUBN */
+        repeatable = TRUE;
+    } else if (btns) {
+        if (btns & KEY_A)
+            key = '.', repeatable = TRUE;
+        else if (btns & KEY_B)
+            key = 'i';
+        else if (btns & KEY_X)
+            key = ',';
+        else if (btns & KEY_Y)
+            key = 's';
+        else if (btns & KEY_START)
+            key = 'S';
+        else if (btns & KEY_SELECT)
+            key = '?';
+    }
+
+    if (!key) {
+        last_key = 0;
+        last_mask = 0;
+        frames_since = 0;
+        return 0;
+    }
+    ++frames_since;
+    if (key == last_key && held == last_mask && !repeatable)
+        return 0; /* non-repeatable button still held */
+    if (key == last_key && held == last_mask && frames_since < 8)
+        return 0; /* auto-repeat throttle (~130 ms) */
+    last_key = key;
+    last_mask = held;
+    frames_since = 0;
+    nh3ds_any_button_ever = TRUE;
+    return key;
+}
+
+/* blocking read used by both input events */
+static int
+nh3ds_read_key(void)
+{
+    int key;
+
+    for (;;) {
+        key = nh3ds_next_key();
+        if (key)
+            return key;
+        /* demo mode: nobody has ever touched the controls, keep the
+         * game moving with the forced no-op rest ('m' prefix + '.');
+         * once any button is seen, real input takes over for good */
+        if (!nh3ds_any_button_ever) {
+            nh3ds_demo_toggle = !nh3ds_demo_toggle;
+            return nh3ds_demo_toggle ? '.' : 'm';
+        }
     }
 }
 
@@ -803,44 +910,65 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
         printf("%s\n", args[0].s ? args[0].s : "");
         nh3ds_log("[raw_print] %s", args[0].s ? args[0].s : "");
     } else if (!strcmp(name, "shim_nhgetch")) {
-        /* rest one turn: keeps moveloop ticking */
-        rint = '.';
+        rint = nh3ds_read_key();
         ++nh3ds_getch_n;
         if (nh3ds_getch_n == 1 || nh3ds_getch_n % 2048 == 0)
-            nh3ds_log("[nhgetch n=%lu] returning '.'", nh3ds_getch_n);
-        gspWaitForVBlank();
+            nh3ds_log("[nhgetch n=%lu] '%c'", nh3ds_getch_n, (char) rint);
     } else if (!strcmp(name, "shim_nh_poskey")) {
-        /* P1 canned input: alternate the 'm' (#reqmenu) prefix with '.'
-         * (rest).  A plain '.' is refused by safe_wait when a monster is
-         * nearby ("Are you waiting to get hit?  Use 'm' prefix to force
-         * a no-op") which would freeze the turn counter; the m/. pair is
-         * exactly the forced no-op rest the game itself suggests, so the
-         * moveloop turn counter advances.  Phase 2b: real button input. */
-        rint = (nh3ds_poskey_n & 1) ? '.' : 'm';
+        rint = nh3ds_read_key();
         ++nh3ds_poskey_n;
-        if (nh3ds_poskey_n == 1 || nh3ds_poskey_n % 16384 == 0)
-            nh3ds_log("[nh_poskey n=%lu] moves=%ld returning '%c'",
-                      nh3ds_poskey_n, svm.moves, (char) rint);
+        if (nh3ds_poskey_n == 1 || nh3ds_poskey_n % 2048 == 0)
+            nh3ds_log("[nh_poskey n=%lu] moves=%ld '%c'", nh3ds_poskey_n,
+                      svm.moves, (char) rint);
         nh3ds_refresh();
-        gspWaitForVBlank();
     } else if (!strcmp(name, "shim_nhbell")) {
         /* nothing */
     } else if (!strcmp(name, "shim_doprev_message")) {
         rint = 0;
     } else if (!strcmp(name, "shim_yn_function")) {
         const char *query = args[0].s ? args[0].s : "";
+        const char *resp = args[1].s;
         char def = (char) args[2].i;
+        char ans = 0;
 
-        /* relaunch friendliness: a stale lock file from a killed run
-         * prompts "There is already a game in progress under your name.
-         * Destroy old game?" -- answer yes so save/restore can be tested
-         * repeatedly (phase 2b: real prompt via buttons) */
-        if (strstr(query, "Destroy old game"))
-            rint = 'y';
-        else
-            rint = def ? def : 'n';
-        nh3ds_log("[yn_function def='%c'] %s -> '%c'",
-                  def ? def : '?', query, (char) rint);
+        /* relaunch friendliness in demo mode: a stale lock file from a
+         * killed run prompts "There is already a game in progress under
+         * your name.  Destroy old game?" -- answer yes automatically so
+         * unattended save/restore testing keeps working */
+        if (!nh3ds_any_button_ever) {
+            if (strstr(query, "Destroy old game"))
+                ans = 'y';
+            else
+                ans = def ? def : 'n';
+            rint = ans;
+            nh3ds_log("[yn demo def='%c'] %s -> '%c'", def ? def : '?',
+                      query, ans);
+        } else {
+            /* real play: B = no/escape, A (or any action button) =
+             * default / first allowed answer; directions are ignored */
+            for (;;) {
+                int key = nh3ds_read_key();
+                char c = (char) key;
+
+                if (c == 'i') { /* B: no / escape */
+                    ans = (resp && strchr(resp, 'n')) ? 'n' : '\033';
+                    break;
+                }
+                if (c == '.' || c == 's' || c == ',' || c == 'S'
+                    || c == '?') {
+                    if (def && resp && strchr(resp, def))
+                        ans = def;
+                    else if (resp && *resp)
+                        ans = *resp;
+                    else
+                        ans = 'y';
+                    break;
+                }
+            }
+            rint = ans;
+            nh3ds_log("[yn buttons def='%c'] %s -> '%c'", def ? def : '?',
+                      query, ans);
+        }
     } else if (!strcmp(name, "shim_getlin")) {
         /* cancel-style answer; phase 2c: software keyboard */
         if (args[1].p)
