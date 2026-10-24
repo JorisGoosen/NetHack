@@ -1,7 +1,10 @@
 NetHack 5.0 for Nintendo 3DS -- Port Plan
 =========================================
 
-Status:   planning / scaffolding
+Status:   P0 + P1 + P2 MVP DONE 2026-10-24 (overnight build session): the
+          committed build cross-compiles, boots in Azahar, plays (movement,
+          menus, swkbd), saves/restores, dies to tombstone + topten, exits
+          cleanly. P3/P4/P5 pending; real hardware untested.
 Game:     NetHack 5.0.1 (VERSION_MAJOR 5, VERSION_MINOR 0, PATCHLEVEL 1)
 Branch:   `3ds`
 Host:     Arch Linux x86-64 (cross toolchain), authoring possible on any host
@@ -70,13 +73,35 @@ Key property: the game never touches the 3DS directly. Everything
 newlib gap-fillers. The shim boundary is also what the official web frontend
 (nethack.js) runs on, so the event stream is known-good and complete.
 
-Build system integration (proposed)
------------------------------------
+Build system integration (spec, verified against the tree)
+----------------------------------------------------------
 Follow the four existing cross targets (msdos, amiga, wasm, mips). Three
 files carry the per-target rules; all additions are `ifdef`-isolated so they
 fold back upstream cleanly (per `Porting`: always add, never delete).
 
-1. `sys/unix/hints/include/cross-pre1.501` -- target declaration block:
+How the pieces connect (verified while writing this spec):
+
+* `hints/linux.501` `#-INCLUDE`s cross-pre1.501 (line 66), cross-pre2.501
+  (559) and cross-post.501 (604); setup.sh splices the hints into the top
+  Makefile, src/Makefile and util/Makefile, so one ifdef block serves both
+  the top-level and the src-level make.
+* cross-pre1.501's generic `ifdef CROSS` tail clears PREGAME, BUILDMORE,
+  CLEANMORE and PACKAGE; each per-target section re-appends with `+=`.
+* Top-level `all:` depends on ALLDEP (Makefile.top lines 129-132). Each
+  cross target overrides ALLDEP to "<dat/ deps> <phony>" where the phony
+  (e.g. `wasm:` at Makefile.top line 249) cds into src and drives the real
+  file rule in cross-post. `multiw-1.501` line 23 sets NHV=501 (zip names).
+* `multiw-2.501` sorts out window ports: with no tty/curses/X11/Qt wanted,
+  WINCFLAGS gets -DNOTTYGRAPHICS, and `WANT_LIBNH` sets
+  `WANT_DEFAULT=shim` (lines 50-52). The shim windowport reaches the link
+  through SYSOBJ (winshim.o) plus -DDEFAULT_WINDOW_SYS=\"shim\".
+* Generic compile rules for winshim.o (Makefile.src line 1142),
+  posixregex.o (line 932) and unixunix.o (line 943) already exist; only
+  libnhmain.o and the new sys/3ds objects need rules of their own.
+* `targets/*` is gitignored; the PREGAME mkdir creates targets/3ds/.
+
+1. `sys/unix/hints/include/cross-pre1.501` -- target declaration block
+   (modeled on the WASM block, lines 18-27):
 
        ifdef CROSS_TO_3DS
        CROSS=1
@@ -89,51 +114,174 @@ fold back upstream cleanly (per `Porting`: always add, never delete).
        override TARGET_LIBS=
        endif
 
-2. `sys/unix/hints/include/cross-pre2.501` -- toolchain + flags block, modeled
-   on the WASM section (lines ~302-424):
+2. `sys/unix/hints/include/cross-pre2.501` -- toolchain + flags section
+   (new `ifdef CROSS_TO_3DS` right after the WASM section, which ends at
+   line 424):
 
-       override TARGET_CC  = $(DEVKITARM)/bin/arm-none-eabi-gcc
-       override TARGET_CXX = $(DEVKITARM)/bin/arm-none-eabi-g++
-       override TARGET_AR  = $(DEVKITARM)/bin/arm-none-eabi-ar
-       override TARGET_LINK= $(DEVKITARM)/bin/arm-none-eabi-gcc
+       # Host setup (below) exports DEVKITPRO/DEVKITARM via env.sh;
+       # these ?= defaults are only fallbacks:
+       DEVKITPRO ?= /opt/devkitpro
+       DEVKITARM ?= $(DEVKITPRO)/devkitARM
+       LIBCTRU   ?= $(DEVKITPRO)/libctru
+       ifeq "$(DEVKITARM)" ""
+       $(error CROSS_TO_3DS requires devkitPro; set DEVKITPRO/DEVKITARM)
+       endif
 
-   3DS_CFLAGS (base, from devkitPro 3ds_rules):
-       -march=armv6k -mtune=mpcore -mfloat-abi=softfp -mfpu=vfp -O2
-   plus the WASM-section define set, adapted:
-       -DSYSCF -DSYSCF_FILE=\"sysconf\" -DNHUUID? -> -DNONHUUID (no crypto src)
-       -DSECURE? -> drop (no setuid semantics on 3DS)
-       -DDLB -DHACKDIR=\"$(HACKDIR)\" -DDEFAULT_WINDOW_SYS=\"shim\"
-       -DNOMAIL -DNO_SIGNAL -DNO_FILE_LINKS -DNOTTYGRAPHICS
-       -DSHIM_GRAPHICS -DLIBNH
-       -DCROSSCOMPILE -DCROSSCOMPILE_TARGET -DCROSS_TO_3DS -D__3DS__
-       $(LUAINCL) -I../include -I../nhlua/lua/src
+       override TARGET_CC   = $(DEVKITARM)/bin/arm-none-eabi-gcc
+       override TARGET_CXX  = $(DEVKITARM)/bin/arm-none-eabi-g++
+       override TARGET_AR   = $(DEVKITARM)/bin/arm-none-eabi-ar
+       override TARGET_LINK = $(DEVKITARM)/bin/arm-none-eabi-gcc
 
-   SYSSRC (start from the WASM set, trimmed to what actually links):
-       ../sys/libnh/libnhmain.c      (game entry: nhmain(argc, argv))
-       ../win/shim/winshim.c         (shim windowport)
-       ../sys/3ds/nh3dslib.c         (newlib gap-fillers, see below)
-       possibly ../sys/unix/unixunix.c / unixres.c if referenced; drop
-       ../sys/share/ioctl.c + unixtty.c if devkitARM newlib lacks termios/ioctl
-       REGEXOBJ = posixregex.o (sys/share/posixregex.c; devkitARM newlib
-       ships <regex.h>; fallback: cppregex.cpp via libstdc++, or bundle pcre)
+       3DS_ARCH = -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
+       3DS_CFLAGS = -c -O2 $(3DS_ARCH) -mword-relocations -std=gnu17 \
+           -fomit-frame-pointer \
+           -ffunction-sections -fdata-sections \
+           -I../include -I../nhlua/lua/src -I$(LIBCTRU)/include \
+           $(LUAINCL) $(WINCFLAGS) \
+           -DSYSCF -DSYSCF_FILE=\"sysconf\" -DNONHUUID \
+           -DDLB -DHACKDIR=\"$(HACKDIR)\" -DDEFAULT_WINDOW_SYS=\"shim\" \
+           -DNOMAIL -DNO_SIGNAL -DNO_FILE_LINKS -DNOTTYGRAPHICS \
+           -DSHIM_GRAPHICS -DLIBNH -DNOPANICTRACE \
+           -DCROSSCOMPILE -DCROSSCOMPILE_TARGET -DCROSS_TO_3DS -D__3DS__ \
+           -Wall -Wextra -Wno-missing-field-initializers -Wreturn-type \
+           -Wunused -Wformat -Wswitch -Wshadow
+       override TARGET_CFLAGS = $(3DS_CFLAGS)
+       LUA_TARGET_CFLAGS = $(TARGET_CFLAGS)
+       override TARGET_CXXFLAGS = $(TARGET_CFLAGS)
+       override TARGET_LFLAGS = $(3DS_ARCH) -L$(LIBCTRU)/lib
+       override TARGET_LIBS += -lctru -lm
 
-3. `sys/unix/hints/include/cross-post.501` -- link + data + package rules:
+       override SYSSRC = ../sys/libnh/libnhmain.c \
+           ../sys/unix/unixunix.c \
+           ../win/shim/winshim.c \
+           ../sys/3ds/nh3ds.c ../sys/3ds/nh3dslib.c
+       override SYSOBJ = $(TARGETPFX)libnhmain.o $(TARGETPFX)unixunix.o \
+           $(TARGETPFX)winshim.o \
+           $(TARGETPFX)nh3ds.o $(TARGETPFX)nh3dslib.o
+       override REGEXOBJ = $(TARGETPFX)cppregex.o
+       override CPLUSPLUS_NEEDED = 1
+       override TARGET_LINK = $(DEVKITARM)/bin/arm-none-eabi-g++
+       override WINLIB=
+       override LUALIB=
+       override LUALIBS=
+       override LUATOPLIB=
+       override WINOBJ=
+       override UUIDOBJ=
+       override DLLIB=
+       override GAME=
+       override GAMEBIN = $(TARGETPFX)NetHack3ds.3dsx
+       3DS_DAT = bogusmon data engrave epitaph oracles quest.lua rumors
+       3DSDEP = include/nhlua.h $(3DS_DAT) spec_levs check-dlb
+       override ALLDEP = $(3DSDEP) 3ds
+       override PREGAME += mkdir -p $(TARGETDIR) $(TARGETPFX)3ds-data ;
+       override CLEANMORE += rm -rf $(TARGETDIR) ;
 
-       $(TARGETPFX)NetHack3ds.elf: pregame $(TARGET_HACKLIB) $(TARGETPFX)date.o \
-               $(HOBJ) $(LUACROSSLIB) $(TARGETPFX)nh3ds.o
+   Decisions (each one verified against source, replacing the older
+   question marks):
+
+   * -DNONHUUID: libnhmain.c's get_nhuuid() falls back to an all-zero uuid
+     under NONHUUID; no libcrypto on the target. (WASM instead uses NHUUID
+     via emscripten crypto.)
+   * -DSYSCF_FILE=\"sysconf\": the relative name resolves through
+     fqname(filep, SYSCONFPREFIX, 0) against HACKDIR (sdmc:/3ds/nethack) --
+     exactly where the pkg installs it. No -DSECURE (no setuid semantics
+     on 3DS; add back only if SYSCF handling complains).
+   * -DNO_FILE_LINKS: src/files.c has an open/create fallback for
+     getlock() for filesystems without link() (FAT on the SD card).
+   * -DNOPANICTRACE: this tree is NH_STATUS_WIP (patchlevel.h line 33), so
+     PANICTRACE would otherwise be compiled in (global.h line 444) and
+     pull in exec()/gdb/backtrace machinery that cannot exist on 3DS.
+     -DNOPANICTRACE undefs it the same way MSDOS does (config.h line 263).
+   * -DNO_SIGNAL: also makes libnhmain.c's sethanguphandler() disappear
+     entirely (`#ifndef NO_SIGNAL`), so no signal stubs are needed at all.
+   * SYSSRC as implemented (P1): libnhmain.c + unixunix.c (IS needed --
+     getlock/HLOCK) + winshim.c + the sys/3ds objects. unixres.c,
+     ioctl.c and unixtty.c are NOT linked: unixtty.c needs termios which
+     devkitARM newlib lacks, so error()/intron()/introff() are
+     reimplemented in nh3dslib.c. (Note: the WASM section's longer list
+     is not evidence of need -- wasm links with
+     -s ERROR_ON_UNDEFINED_SYMBOLS=0.)
+   * Regex resolved in P1: cppregex.cpp (libstdc++) from the start --
+     devkitARM newlib's <regex.h> was not trusted. Consequences:
+     CPLUSPLUS_NEEDED=1 and TARGET_LINK=arm-none-eabi-g++.
+   * nh3dslib.c stub set (P1-verified): getlogin/getpwnam/getpwuid ->
+     NULL, getuid -> 1, umask/creat/waitpid/getgid/setgid/setuid/execv
+     no-ops, fcntl F_SETLK/F_SETLKW/F_UNLCK -> 0 (libsysbase rejects
+     F_SETLK; without the stub lock_file() on perm fails and the game
+     quits). chmod/chdir/mkdir exist in libsysbase.
+   * -D__3DS__ spelled out explicitly -- verified NOT predefined by
+     devkitARM 16.1.0's gcc (-dM check), so it is required.
+   * -mfloat-abi=hard, NOT softfp: P0 verified that softfp selects the
+     bare armv6k multilib where 3dsx_crt0.o and -lctru do not exist --
+     modern devkitPro builds the 3DS hard-float (their 3ds_rules use
+     -mfloat-abi=hard -mtp=soft). -mword-relocations completes the 32-bit
+     ABI requirements.
+   * -std=gnu17: devkitARM 16.1.0 is GCC 16, which defaults to C23; the
+     mac68k sections already document that C23 breaks savefile.h's
+     _Generic save dispatch. Same medicine, preemptively.
+   * REGEXOBJ: cppregex.o (see above; posixregex was the first choice on
+     paper but cppregex was taken immediately in P1).
+   * GNU_LIBC caveat: resolved in P1 -- -DGNU_LIBC (inherited from
+     multiw-2.501 ~line 205) works as-is on newlib; the MUSL=1 fallback
+     was not needed.
+   * mkdir(\"save\", 0777) at startup (in nh3ds.c): set_savefile_name()
+     builds save/<uid><plname> under the playground but nothing creates
+     the save/ subdirectory -- without this, #save silently writes
+     nothing and auto-restore can never work. Found by P2 testing.
+
+3. `sys/unix/hints/include/cross-post.501` -- link + data + package rules
+   (new `ifdef CROSS_TO_3DS` section; model: WASM data rules + MIPS pkg):
+
+       3DS_DATA_DIR = $(TARGETPFX)3ds-data
+       3DS_TARGET = $(TARGETPFX)NetHack3ds.3dsx
+
+       $(TARGETPFX)libnhmain.o : ../sys/libnh/libnhmain.c $(HACK_H)
+       $(TARGETPFX)unixunix.o : ../sys/unix/unixunix.c $(HACK_H)
+       $(TARGETPFX)nh3ds.o : ../sys/3ds/nh3ds.c $(HACK_H)
+       $(TARGETPFX)nh3dslib.o : ../sys/3ds/nh3dslib.c $(HACK_H)
+
+       $(TARGETPFX)NetHack3ds.elf: pregame $(TARGET_HACKLIB) \
+               $(TARGETPFX)date.o $(HOSTOBJ) $(HOBJ) $(LUACROSSLIB) \
+               $(3DS_DATA_DIR)
+           -rm $@
            $(TARGET_LINK) -specs=3dsx.specs $(TARGET_LFLAGS) -o $@ \
                $(HOBJ) $(TARGETPFX)date.o $(TARGET_HACKLIB) \
-               $(TARGETPFX)nh3ds.o $(TARGET_LIBS) -lctru -lm
-       $(TARGETPFX)NetHack3ds.3dsx: $(TARGETPFX)NetHack3ds.elf
-           $(DEVKITARM)/bin/3dsxtool $< $@ --smdh=$(TARGETPFX)NetHack3ds.smdh ...
-       $(TARGETPFX)3ds-data/: nhdat + touch record/logfile/perm + cp sysconf
-       3dspkg: assemble targets/3ds/pkg (3dsx, nhdat, sysconf, defaults.nh,
-       license, symbols) + zip -> targets/3ds/nh5013ds.zip
+               $(LUACROSSLIB) $(TARGETPFX)nh3ds.o $(TARGET_LIBS)
+
+       $(3DS_TARGET): $(TARGETPFX)NetHack3ds.elf
+           $(DEVKITPRO)/tools/bin/3dsxtool $< $@
+
+       $(3DS_DATA_DIR): $(3DS_DATA_DIR)/nhdat
+           touch $(3DS_DATA_DIR)/perm $(3DS_DATA_DIR)/record \
+               $(3DS_DATA_DIR)/logfile $(3DS_DATA_DIR)/xlogfile
+           cp ../sys/libnh/sysconf $(3DS_DATA_DIR)/sysconf
+
+       $(3DS_DATA_DIR)/nhdat:
+           ( cd ..; $(MAKE) INSTDIR='$(3DS_DATA_DIR)' $(3DSDEP) dofiles-dlb )
+
+       .PHONY: 3dspkg
+       3dspkg: $(3DS_TARGET) $(3DS_DATA_DIR)
+           mkdir -p $(TARGETPFX)pkg/nethack
+           cp $(3DS_TARGET) $(TARGETPFX)pkg/
+           cp $(3DS_DATA_DIR)/nhdat $(3DS_DATA_DIR)/sysconf \
+               $(TARGETPFX)pkg/nethack/
+           touch $(TARGETPFX)pkg/nethack/record \
+               $(TARGETPFX)pkg/nethack/logfile $(TARGETPFX)pkg/nethack/perm
+           cp ../sys/3ds/defaults.nh $(TARGETPFX)pkg/nethack/defaults.nh
+           cp ../dat/license ../dat/symbols $(TARGETPFX)pkg/nethack/
+           cp ../sys/3ds/README.3ds $(TARGETPFX)pkg/
+           cd $(TARGETPFX)pkg && zip -9r ../nh$(NHV)3ds.zip *
+           @echo 3DS package zip file $(TARGETPFX)nh$(NHV)3ds.zip
+
+   No SMDH/icon for P1 -- 3dsxtool works without --smdh; add an icon in
+   P3/P5 (smdhtool wants a 48x48 png). $(NHV) is 501 (multiw-1.501), so
+   the zip is nh5013ds.zip.
 
 4. `sys/unix/Makefile.top` -- a `3ds:` rule next to the `wasm:` rule
        (line ~249): ( cd src ; $(MAKE) CROSS_TO_3DS=1 ../targets/3ds/NetHack3ds.3dsx )
 
-5. `sys/unix/README.hints` -- document `make CROSS_TO_3DS=1`.
+5. `sys/unix/README.hints` -- document `make CROSS_TO_3DS=1` and the
+   devkitPro prerequisite.
 
 No changes to `hints/linux.501` / `hints/macOS.501` themselves: both already
 pull in cross-pre1/pre2/post via `#-INCLUDE` (processed by setup.sh), and the
@@ -142,6 +290,15 @@ ifdef guards keep them inert until CROSS_TO_3DS=1 is passed.
 sys/3ds/ components
 -------------------
 * `nh3ds.c` -- the front-end and 3DS "main". Responsibilities:
+    - status: P2 MVP is implemented (see Implementation status below):
+      full console rendering (top 50x30 map/messages/status, bottom 40x30
+      tail/popups), hid input mapping, buffered menus, swkbd text entry,
+      save/restore glue, and a canned demo/attract mode for unattended
+      emulator testing. The original P1 stub is in git history.
+    - callback form: the non-emscripten shim takes a direct C function
+      pointer, `void (*)(const char *name, void *ret_ptr, const char *fmt,
+      ...)` (winshim.c lines 84-90) -- the string-named callback is the
+      emscripten/JS path only.
     - startup: gfxInitDefault, two consoles (see layout), fsInit/sdmc, atexit
       cleanup; then `shim_graphics_set_callback(shim_cb); nhmain(1, argv);`
     - shim callback: one variadic function; parse `fmt` chars ('i' int,
@@ -157,17 +314,29 @@ sys/3ds/ components
       browsable on bottom screen.
     - status: `status_update` events are field-structured (fldidx + value +
       color) -> render a proper 2-row status bar, not a tty string.
+      Labels are port-owned (nh3ds_st_initfmt[]) because the core's
+      genl_status_enablefield never forwards fmts to the port (mirrors
+      curses/wintty).
     - menus: buffer add_menu items per winid; select_menu renders the list
       on the bottom screen (d-pad navigate, A select/toggle, B/START done),
       returns selected MENU_ITEM_P array; paginate.
     - text input: libctru software keyboard (swkbd) for getlin, askname,
       yn_function (when resp is long), get_ext_cmd (typed command name).
+      get_ext_cmd is reimplemented over our own menus -- upstream
+      extcmd_via_menu() is TTY/CURSES-only.
     - display_file: read via dlb (extern dlb_fopen in the lib), paginated
       into a NHW_TEXT window.
-* `nh3dslib.c` -- newlib gap-fillers the game expects but devkitARM lacks:
-  getlogin/getpwnam/getpwuid -> NULL (whoami() then falls back to askname),
-  anything else link errors reveal. NO_SIGNAL/NO_FILE_LINKS remove the rest.
-* `sysconf` -- copy of `sys/libnh/sysconf` (SYSCF is enabled).
+* `nh3dslib.c` -- newlib gap-fillers the game expects but devkitARM lacks.
+  P1-verified set: getlogin/getpwnam/getpwuid -> NULL, getuid -> 1,
+  umask/creat/waitpid/getgid/setgid/setuid/execv no-ops, fcntl
+  F_SETLK/F_SETLKW/F_UNLCK -> 0 (libsysbase rejects F_SETLK; without the
+  stub lock_file() on perm fails and the game quits). chmod/chdir/mkdir
+  exist in libsysbase. unixtty.c is NOT linked, so error()/intron()/
+  introff() are reimplemented here. NO_SIGNAL/NO_FILE_LINKS/NOMAIL define
+  the rest away (sethanguphandler() vanishes entirely under NO_SIGNAL).
+* `sysconf` -- not a new file: the pkg rule copies `sys/libnh/sysconf`
+  (SYSCF is enabled; its PANICTRACE_* entries are inert with
+  -DNOPANICTRACE).
 * `defaults.nh` -- sample config (OPTIONS for shim UI; windowtype is baked
   to "shim" anyway).
 * `README.3ds` -- install/run instructions for players.
@@ -191,27 +360,34 @@ Proposed button mapping (tunable; NetHackDS-style, remappable later):
     A                    '.' (rest / advance) -- also "yes/ok" in prompts
     B                    'i' inventory          [menus: cancel]
     X                    ',' pick up            [menus: toggle]
-    Y                    's' search
+    Y                    's' search; explicit 'y' in yn prompts
     START                'S' save               [menus: confirm]
     SELECT               '?' help
-    Prompts (yn)         A = default/first letter, B = 'n'/escape,
-                         swkbd fallback when resp doesn't fit buttons
+    Prompts (yn)         A = default/first letter, Y = explicit 'y',
+                         B = 'n'/escape, swkbd fallback when resp doesn't
+                         fit buttons (Y-as-y is needed for default-'n'
+                         prompts like "Really save?")
     Text entry           swkbd (name, wishes, #commands, engrave, ...)
 
 Roadmap
 -------
-P0  Host toolchain ready: devkitpro-pacman + `dkp-pacman -S 3ds-dev 3ds-tools`;
-    hello-world .3dsx runs on target (real device via Homebrew Launcher or
-    emulator) -- sanity only, not committed.
+P0  DONE 2026-10-24. Toolchain = full `3ds-dev` group (22 pkgs: devkitARM
+    16.1.0, libctru 2.7.0, 3dstools/3dslink/tex3ds/...) installed via
+    local-root pacman under /mnt/halveGig/virtuoos/devkitpro/ -- see Host
+    setup below. P0 hello-world .3dsx builds + converts (valid 3DSX
+    header). Not committed.
 
-P1  `make CROSS_TO_3DS=1` cross-compiles the game (core + Lua + shim) into an
-    ARM static archive; resolve newlib gaps. Exit: archive links with a stub
-    main.
+P1  DONE 2026-10-24 (commits 8d72aad2a, 823d24fd4): CROSS_TO_3DS builds the
+    full game (core + Lua + shim + front-end) and links NetHack3ds.3dsx;
+    newlib gaps resolved in nh3dslib.c. Exit met: boots in Azahar through
+    moveloop.
 
-P2  Front-end MVP playable: boots to character creation (swkbd), map renders,
-    movement + basic commands work, save/restore works, death -> record file.
-    Exit: a full ascension-attemptable session in Azahar (Citra fork) and on
-    real hardware via `3dslink`.
+P2  DONE 2026-10-24 (commits 5294dab31, 69ca9b585, 4fabae251, 62c283943):
+    console rendering, hid input, menus + swkbd, character creation,
+    save/restore, death -> tombstone -> topten -> clean exit -- all
+    verified in Azahar (see Implementation status below). The "full
+    ascension-attemptable session" is met mechanically; a long real-input
+    play session is the remaining bit (demo mode plays itself meanwhile).
 
 P3  UX polish: bottom-screen menus w/ touch, message history browsing, key
     remapping, options via defaults.nh, status hilites/colors, ~50-col
@@ -226,37 +402,124 @@ P5  (optional) .cia packaging (makerom+bannertool), upstream pull request to
     are shaped for that (the devteam's Cross-compiling doc explicitly invites
     this).
 
+Implementation status (2026-10-24, overnight session)
+-----------------------------------------------------
+Branch `3ds`, six commits, nothing pushed:
+
+    8d72aad2a  build integration + P1 stub front-end
+    823d24fd4  Azahar boot fixes (select_menu -1, canned rests, fcntl)
+    5294dab31  P2a console rendering (map/messages/status, colors)
+    69ca9b585  P2b hid input (d-pad hjkl, L/R run, A/B/X/Y/START/SELECT)
+    4fabae251  P2c menus + swkbd + character creation + get_ext_cmd
+    62c283943  save/restore (mkdir("save") fix, Y=y in prompts, tail)
+
+Verified in Azahar: boot -> character creation -> movement -> menus ->
+save ("save/1Wizard" written, alock.* cleaned) -> restore ("Hello Wizard,
+... welcome back", resumed turn) -> death (jackal) -> tombstone -> topten
+-> clean exit. Sizes: NetHack3ds.3dsx 3,921,508 B; elf 6,136,632 B (with
+symbols); nh5013ds.zip 2,368,931 B.
+
 Risks / open questions
 ----------------------
-* devkitARM newlib gaps (getpwuid, signals, maybe termios/ioctl): stubbed in
-  nh3dslib.c; NO_SIGNAL/NO_FILE_LINKS/NOMAIL define away most of it.
-* getlock()/save locking on FAT: OK -- src/files.c has a NO_FILE_LINKS path
-  (uses open/create instead of link()).
-* regex: posixregex vs devkitARM newlib's regex.h; verify early in P1.
-  Fallbacks: cppregex.cpp (libstdc++) or bundled pcre.
-* Lua + core in 64 MB (old3DS): comfortable; nhdat ~1-2 MB on SD.
+Resolved while writing the spec:
+
+* NHUUID: use -DNONHUUID; libnhmain.c then uses an all-zero uuid, no
+  libcrypto needed. (WASM's NHUUID path is emscripten-specific.)
+* sysconf location: -DSYSCF_FILE=\"sysconf\" resolves via fqname against
+  HACKDIR, where the pkg installs it. No -DSECURE.
+* getlock()/save locking on FAT: OK -- src/files.c has a NO_FILE_LINKS
+  path (uses open/create instead of link()), enabled by -DNO_FILE_LINKS.
+* PANICTRACE: tree is NH_STATUS_WIP so it would compile in; -DNOPANICTRACE
+  (the MSDOS knob, config.h line 263) removes it and the copied sysconf's
+  PANICTRACE_* entries become inert.
+* signals: -DNO_SIGNAL removes sethanguphandler() and friends outright.
+* Toolchain specifics (P0-verified): -mfloat-abi=hard (+ -mtp=soft,
+  -mword-relocations) mandatory; -D__3DS__ NOT predefined by devkitARM
+  16.1.0; -specs=3dsx.specs found by name (lives in
+  $DEVKITARM/arm-none-eabi/lib/); -L$(LIBCTRU)/lib must be explicit;
+  gcc relocates cleanly to the custom prefix.
+
+Resolved by P1/P2 (overnight build):
+
+* newlib gaps: enumerated stub set in nh3dslib.c (see components).
+* regex: cppregex.cpp + libstdc++; TARGET_LINK is g++.
+* unixunix.c IS linked (getlock/HLOCK); unixres.c/ioctl.c/unixtty.c are
+  not (error/intron/introff reimplemented in nh3dslib.c).
+* -DGNU_LIBC on newlib: works as-is; MUSL=1 not needed.
+* Memory: NetHack3ds.3dsx 3.74 MiB, elf 5.85 MiB (with symbols),
+  nh5013ds.zip 2.26 MiB -- comfortable in 64 MB (old3DS).
+
+Still open:
+
+* Real hardware via 3dslink untested (Azahar only so far); bottom-screen
+  redraw cost on device unknown.
+* swkbd fallback for yn prompts with long response sets (buttons cover
+  current cases).
+* getmsghistory() still returns empty (restore works via putmsghistory
+  replay).
+* Touch input for menus, message-history browsing, key remapping,
+  defaults.nh options (P3); tiles/stereo (P4); .cia (P5).
 * 8x8 console font = 50 map columns: viewport scroll solves it; revisit font
   in P3/P4.
 * No fork/exec/threads needed by the game (moveloop is single-threaded) --
   matches 3DS fine. delay_output -> svcSleep.
-* Emulator vs hardware drift: test on both; Azahar for iteration, 3dslink
-  for on-device deploys.
 
-Host setup (Arch Linux)
------------------------
-    # devkitPro pacman (official package/script from devkitpro.org), then:
-    sudo dkp-pacman -S 3ds-dev 3ds-tools
-    export DEVKITPRO=/opt/devkitpro
-    export DEVKITARM=/opt/devkitpro/devkitARM
+Host setup (Arch Linux) -- DONE: local install, no root
+-------------------------------------------------------
+devkitPro lives entirely under /mnt/halveGig/virtuoos/devkitpro/ (530 MB,
+everything owned by user virtuoos):
+
+    pacman.conf   local pacman config: RootDir=root, DBPath=db,
+                  CacheDir=cache, GPGDir=gnupg (NOT /etc),
+                  SigLevel = Required DatabaseRequired,
+                  [dkp-libs]  https://pkg.devkitpro.org/packages
+                  [dkp-linux] https://pkg.devkitpro.org/packages/linux/x86_64/
+    env.sh        export DEVKITPRO=.../devkitpro/root/opt/devkitpro
+                  export DEVKITARM=$DEVKITPRO/devkitARM
+                  PATH += $DEVKITARM/bin:$DEVKITPRO/tools/bin
+    root/         the toolchain (423M): devkitARM 16.1.0 (GCC 16), libctru
+                  2.7.0, tools (3dsxtool, smdhtool, 3dslink, tex3ds, ...) in
+                  root/opt/devkitpro/tools/bin
+    p0-test/      P0 hello-world: builds, 3dsxtool -> valid .3dsx
+
+P0-verified build facts (baked into the cross-pre2 spec above):
+* -mfloat-abi=hard -mtp=soft -mword-relocations (hard-float is the
+  multilib that carries 3dsx_crt0.o + newlib; softfp does not link).
+* -D__3DS__ not predefined by gcc -- pass it explicitly.
+* -specs=3dsx.specs found by name; -L$DEVKITPRO/libctru/lib explicit;
+  -lctru -lm. gcc relocation to the custom prefix works.
+* libctru ships no .pc file; use the $DEVKITPRO/libctru paths directly.
+
+pacman maintenance (updates / extra packages): plain pacman refuses db
+writes as non-root (hardcoded geteuid check), so prefix `unshare -r`
+(user namespaces are allowed on this host):
+    unshare -r pacman --config /mnt/halveGig/virtuoos/devkitpro/pacman.conf -Sy
+    unshare -r pacman --config ... -S <pkg>
+Read-only ops (-Q/-Si/-Sg) work without the prefix.
+
+Testing (Azahar, built from source at /mnt/halveGig/virtuoos/azahar/):
+    binary:  /mnt/halveGig/virtuoos/azahar/azahar/build/bin/Release/azahar
+    SD root: ~/.local/share/azahar-emu/sdmc/
+             (sdmc:/3ds/nethack = ~/.local/share/azahar-emu/sdmc/3ds/nethack)
+    logs:    ~/.local/share/azahar-emu/log/
+    NOTE upstream Azahar bug: any long CLI option containing c/x/o is
+    hijacked by getopt -- use short forms only (-f fullscreen, -w
+    windowed, -v version); positional file paths are safe.
+    See also /mnt/halveGig/virtuoos/azahar/REPORT.md and run-azahar.sh.
 
 Build:
+    source /mnt/halveGig/virtuoos/devkitpro/env.sh
     cd sys/unix && sh setup.sh hints/linux.501 && cd ../..
     make CROSS_TO_3DS=1 all
     make CROSS_TO_3DS=1 3dspkg      # -> targets/3ds/pkg + nh5013ds.zip
+    # P1 iteration loop: fix whatever the link complains about (regex,
+    # newlib gaps, unixunix.c/unixres.c) until the .3dsx links with the
+    # stub main.
 
-Run:
+Run (hardware):
     unzip pkg to 3ds:/3ds/nethack on the SD card (or 3dslink NetHack3ds.3dsx
     with the pkg contents in place), launch from the Homebrew Launcher.
+    (Emulator testing: see Azahar above.)
 
 Repo workflow
 -------------
