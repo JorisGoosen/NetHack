@@ -93,6 +93,20 @@ nhev_count(const char *name)
     nh3ds_log("[evt first] %s", name);
 }
 
+/* periodic histogram so that a run killed from outside (pkill) still
+ * leaves an audit trail; the final dump only happens on clean exit */
+static void
+nhev_periodic(void)
+{
+    int i;
+
+    if (nhev_total % 1048576L != 0)
+        return;
+    nh3ds_log("[evt snapshot total=%lu]", nhev_total);
+    for (i = 0; i < nhev_n; ++i)
+        nh3ds_log("[evt n=%8lu] %s", nhev[i].n, nhev[i].name);
+}
+
 static void
 nh3ds_dump_and_close(void)
 {
@@ -153,6 +167,7 @@ union shimarg {
 };
 
 static unsigned long nh3ds_getch_n;
+static unsigned long nh3ds_poskey_n;
 
 static void
 shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
@@ -166,6 +181,7 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
     int i;
 
     nhev_count(name);
+    nhev_periodic();
 
     va_start(ap, fmt);
     for (i = 1; fmt[i] && argn < SHIM_MAXARGS; ++i) {
@@ -228,10 +244,14 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
     } else if (!strcmp(name, "shim_end_menu")) {
         /* nothing yet */
     } else if (!strcmp(name, "shim_select_menu")) {
-        /* no menu UI yet: report an empty selection */
+        /* no menu UI yet: report "cancelled" (-1 == ESC).  Returning 0
+         * would mean "empty menu, nothing selected"; core loops such as
+         * ask_do_tutorial() (options.c) re-issue the menu until they get
+         * a non-zero result, so 0 caused an infinite create_nhwindow
+         * flood (~6400/s).  -1 ends every such loop the ESC way. */
         if (args[2].p)
             *(MENU_ITEM_P **) args[2].p = (MENU_ITEM_P *) 0;
-        rint = 0;
+        rint = -1;
     } else if (!strcmp(name, "shim_message_menu")) {
         /* acknowledge the message (equivalent of pressing the key) */
         rint = args[0].i;
@@ -255,8 +275,17 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
         if (nh3ds_getch_n == 1 || nh3ds_getch_n % 2048 == 0)
             nh3ds_log("[nhgetch n=%lu] returning '.'", nh3ds_getch_n);
     } else if (!strcmp(name, "shim_nh_poskey")) {
-        /* phase 2: button-driven movement / position clicks */
-        rint = '.';
+        /* P1 canned input: alternate the 'm' (#reqmenu) prefix with '.'
+         * (rest).  A plain '.' is refused by safe_wait when a monster is
+         * nearby ("Are you waiting to get hit?  Use 'm' prefix to force
+         * a no-op") which would freeze the turn counter; the m/. pair is
+         * exactly the forced no-op rest the game itself suggests, so the
+         * moveloop turn counter advances.  P2: real button mapping. */
+        rint = (nh3ds_poskey_n & 1) ? '.' : 'm';
+        ++nh3ds_poskey_n;
+        if (nh3ds_poskey_n == 1 || nh3ds_poskey_n % 16384 == 0)
+            nh3ds_log("[nh_poskey n=%lu] moves=%ld returning '%c'",
+                      nh3ds_poskey_n, svm.moves, (char) rint);
     } else if (!strcmp(name, "shim_nhbell")) {
         /* nothing */
     } else if (!strcmp(name, "shim_doprev_message")) {
@@ -374,6 +403,7 @@ main(int argc, char *argv[])
          * check_recordfile() never runs; create the variable files. */
         nh3ds_ensure_file("record");
         nh3ds_ensure_file("logfile");
+        nh3ds_ensure_file("xlogfile");
     }
 
     (void) atexit(nh3ds_cleanup);
