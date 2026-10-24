@@ -9,6 +9,13 @@
  * implemented here.  This file owns the 3DS: console rendering, hid input,
  * the software keyboard, and the process lifecycle.
  *
+ * Phase 2c: menus and text entry.  add_menu streams are buffered per
+ * window; select_menu renders them on the bottom screen (d-pad navigate,
+ * A select/toggle, B cancel, START confirm; PICK_NONE lists wait for a
+ * key like a tty).  getlin/askname use the libctru software keyboard;
+ * #commands run through the core's own extcmd menu.  Character creation
+ * uses the core's generic setup menus once a button press is seen.
+ *
  * Phase 2b: hid input.  D-pad/circle-pad = hjkl (two held = diagonals,
  * L/R+direction = run), A='.' rest, B='i', X=',', Y='s', START='S',
  * SELECT='?'; yn prompts answer via buttons (B = no/esc, A = default).
@@ -29,11 +36,13 @@
  */
 
 #include "hack.h"       /* svp.plname, iflags, flags, NHW_*, ... */
+#include "func_tab.h"   /* extcmdlist, CMD_* flags (not in hack.h) */
 
 #include <3ds.h>
 
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -446,7 +455,7 @@ static const char *const nh3ds_legend[TOP_ROWS - LEG_ROW0] = {
     "pad=hjkl two=diag L/R=run",
     "A=rest B=inv X=grab Y=search",
     "START=save SELECT=help",
-    "NetHack 3DS -- phase 2b",
+    "NetHack 3DS -- phase 2c",
 };
 
 static void
@@ -705,6 +714,222 @@ nh3ds_read_key(void)
 }
 
 /* ----------------------------------------------------------------------*/
+/* menus (phase 2c)                                                       */
+/* ----------------------------------------------------------------------*/
+
+/* one buffered menu window; items are the add_menu() stream between
+ * start_menu and end_menu.  ch == 0 marks non-selectable text
+ * (headings, blank filler). */
+struct nh3ds_menuitem {
+    ANY_P id;
+    char ch, gch;
+    int attr, clr;
+    char str[96];
+    unsigned itemflags;
+};
+#define NH3DS_MAXMENU 128
+static struct nh3ds_menu {
+    winid win;
+    boolean active;
+    int n;
+    int top;                     /* first visible item row */
+    struct nh3ds_menuitem item[NH3DS_MAXMENU];
+    char prompt[128];
+} nh3ds_menu;
+
+static int
+nh3ds_menu_selectable(int i)
+{
+    return nh3ds_menu.item[i].ch != '\0';
+}
+
+/* render the buffered menu on the bottom screen; rows 2..29 list
+ * items, row 1 shows the prompt */
+static void
+nh3ds_menu_render(int cursor)
+{
+    int rows = BOT_ROWS - 2;
+    int i, row, top;
+
+    if (cursor >= 0) {
+        if (cursor < nh3ds_menu.top)
+            nh3ds_menu.top = cursor;
+        if (cursor >= nh3ds_menu.top + rows)
+            nh3ds_menu.top = cursor - rows + 1;
+    }
+    top = nh3ds_menu.top;
+
+    nh3ds_scr(0);
+    printf("\x1b[2J\x1b[0m");
+    printf("\x1b[1;1H\x1b[37;1m%-40.40s", nh3ds_menu.prompt);
+    for (row = 0, i = top; i < nh3ds_menu.n && row < rows; ++i, ++row) {
+        const struct nh3ds_menuitem *m = &nh3ds_menu.item[i];
+        char line[128];
+        const char *tag = "  ";
+
+        if (nh3ds_menu_selectable(i)) {
+            tag = (cursor == i) ? "> " : "  ";
+            if (m->itemflags & MENU_ITEMFLAGS_SELECTED)
+                tag = "* ";
+        }
+        if (m->ch && m->ch != ' ')
+            (void) sprintf(line, "%s%c) %s", tag, m->ch, m->str);
+        else
+            (void) sprintf(line, "%s%s", tag, m->str);
+        if (nh3ds_menu_selectable(i))
+            printf("\x1b[%d;1H\x1b[0m%-40.40s", row + 2, line);
+        else
+            printf("\x1b[%d;1H\x1b[36;1m%-40.40s", row + 2, line);
+    }
+    printf("\x1b[%d;1H\x1b[0m%-40.40s", BOT_ROWS,
+           "pad=move A=ok B=cancel");
+}
+
+/* wait for one edge-triggered button press; returns hidKeysDown bits */static u32
+nh3ds_menu_button(void)
+{
+    u32 down;
+
+    do {
+        do {
+            hidScanInput();
+            gspWaitForVBlank();
+        } while (hidKeysHeld() != 0);
+        do {
+            hidScanInput();
+            gspWaitForVBlank();
+            down = hidKeysDown();
+        } while (down == 0);
+    } while (0);
+    nh3ds_any_button_ever = TRUE;
+    return down;
+}
+
+/* interactive menu selection; returns the number of picks (or -1) and
+ * fills *menulist with a malloc'd menu_item array */
+static int
+nh3ds_menu_pick(int how, MENU_ITEM_P **menulist)
+{
+    int cursor = -1, i, n;
+    MENU_ITEM_P *out;
+
+    for (i = 0; i < nh3ds_menu.n; ++i)
+        if (nh3ds_menu_selectable(i)) {
+            cursor = i;
+            break;
+        }
+    if (cursor < 0)
+        return -1; /* nothing selectable */
+
+    for (;;) {
+        u32 down;
+
+        nh3ds_menu_render(cursor);
+        down = nh3ds_menu_button();
+        if (down & KEY_DUP) {
+            for (i = cursor - 1; i >= 0; --i)
+                if (nh3ds_menu_selectable(i)) {
+                    cursor = i;
+                    break;
+                }
+        } else if (down & KEY_DDOWN) {
+            for (i = cursor + 1; i < nh3ds_menu.n; ++i)
+                if (nh3ds_menu_selectable(i)) {
+                    cursor = i;
+                    break;
+                }
+        } else if (down & KEY_DLEFT) {
+            cursor -= BOT_ROWS - 3;
+            if (cursor < 0)
+                cursor = 0;
+            while (cursor > 0 && !nh3ds_menu_selectable(cursor))
+                --cursor;
+        } else if (down & KEY_DRIGHT) {
+            cursor += BOT_ROWS - 3;
+            if (cursor >= nh3ds_menu.n)
+                cursor = nh3ds_menu.n - 1;
+            while (cursor > 0 && !nh3ds_menu_selectable(cursor))
+                --cursor;
+        } else if (down & KEY_B) {
+            if (how == PICK_ONE)
+                return -1; /* cancel */
+            break;         /* done, keep toggles */
+        } else if (down & (KEY_A | KEY_START)) {
+            if (how == PICK_ONE) {
+                nh3ds_menu.item[cursor].itemflags |=
+                    MENU_ITEMFLAGS_SELECTED;
+                break;
+            }
+            nh3ds_menu.item[cursor].itemflags ^=
+                MENU_ITEMFLAGS_SELECTED;
+        }
+        /* SELECT/Y/X: ignored for now */
+    }
+    n = 0;
+    for (i = 0; i < nh3ds_menu.n; ++i)
+        if (nh3ds_menu.item[i].itemflags & MENU_ITEMFLAGS_SELECTED)
+            ++n;
+    if (n == 0)
+        return 0;
+    out = (MENU_ITEM_P *) malloc((size_t) n * sizeof *out);
+    if (!out)
+        return -1;
+    n = 0;
+    for (i = 0; i < nh3ds_menu.n; ++i)
+        if (nh3ds_menu.item[i].itemflags & MENU_ITEMFLAGS_SELECTED) {
+            out[n].item = nh3ds_menu.item[i].id;
+            out[n].count = -1L; /* "select all" (no count prompt yet) */
+            out[n].itemflags = nh3ds_menu.item[i].itemflags;
+            ++n;
+        }
+    *menulist = out;
+    return n;
+}
+
+/* at character-creation prompts: give a real player a short window to
+ * press a button; unattended runs fall through to the canned answers */
+static void
+nh3ds_detect_player(int frames)
+{
+    int f;
+
+    if (nh3ds_any_button_ever)
+        return;
+    for (f = 0; f < frames; ++f) {
+        hidScanInput();
+        gspWaitForVBlank();
+        if (hidKeysHeld() != 0) {
+            nh3ds_any_button_ever = TRUE;
+            return;
+        }
+    }
+}
+
+/* libctru software keyboard; returns FALSE when cancelled.  The text is
+ * copied into buf (truncated to fit). */
+static boolean
+nh3ds_swkbd(const char *hint, char *buf, size_t buflen)
+{
+    SwkbdState sw;
+    static char tmp[256];
+    SwkbdButton res;
+
+    if (buflen > sizeof tmp)
+        buflen = sizeof tmp;
+    swkbdInit(&sw, SWKBD_TYPE_NORMAL, 2, (int) buflen - 1);
+    swkbdSetHintText(&sw, hint ? hint : "");
+    swkbdSetValidation(&sw, SWKBD_ANYTHING, 0, 0);
+    res = swkbdInputText(&sw, tmp, sizeof tmp);
+    if (res != SWKBD_BUTTON_CONFIRM) {
+        buf[0] = '\0';
+        return FALSE;
+    }
+    (void) strncpy(buf, tmp, buflen - 1);
+    buf[buflen - 1] = '\0';
+    return TRUE;
+}
+
+/* ----------------------------------------------------------------------*/
 /* the shim callback                                                      */
 /* ----------------------------------------------------------------------*/
 
@@ -751,16 +976,39 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
         iflags.window_inited = TRUE;
         nh3ds_log("[init_nhwindows] window_inited=TRUE");
     } else if (!strcmp(name, "shim_player_selection")) {
-        /* phase 2c: role dialog on the bottom screen; phase 1/2a:
-         * role_init() randomizes unspecified facets */
-        nh3ds_log("[player_selection] canned: role/race/gend/align random");
+        nh3ds_detect_player(180); /* 3s to press a button */
+        if (nh3ds_any_button_ever) {
+            /* real play: generic role/race/gender/alignment menus (the
+             * core's genl setup drives this windowport's own menus) */
+            (void) genl_player_setup(80);
+            nh3ds_log("[player_selection] genl setup done");
+        } else {
+            /* demo mode: role_init() randomizes unspecified facets */
+            nh3ds_log("[player_selection] canned: role/race/gend/align random");
+        }
     } else if (!strcmp(name, "shim_player_selection_or_tty")) {
         rint = 0; /* FALSE: don't run the generic tty-style setup */
     } else if (!strcmp(name, "shim_askname")) {
-        (void) strncpy(svp.plname, nh3ds_plname,
-                       sizeof svp.plname - 1);
-        svp.plname[sizeof svp.plname - 1] = '\0';
-        nh3ds_log("[askname] canned plname=\"%s\"", svp.plname);
+        nh3ds_detect_player(180); /* 3s to press a button */
+        if (nh3ds_any_button_ever) {
+            /* real play: software keyboard */
+            if (nh3ds_swkbd("Who are you?", svp.plname,
+                            sizeof svp.plname))
+                nh3ds_log("[askname] swkbd plname=\"%s\"", svp.plname);
+            else {
+                (void) strncpy(svp.plname, nh3ds_plname,
+                               sizeof svp.plname - 1);
+                svp.plname[sizeof svp.plname - 1] = '\0';
+                nh3ds_log("[askname] swkbd cancelled, using \"%s\"",
+                          svp.plname);
+            }
+        } else {
+            /* demo mode: canned name */
+            (void) strncpy(svp.plname, nh3ds_plname,
+                           sizeof svp.plname - 1);
+            svp.plname[sizeof svp.plname - 1] = '\0';
+            nh3ds_log("[askname] canned plname=\"%s\"", svp.plname);
+        }
     } else if (!strcmp(name, "shim_get_nh_event")) {
         /* phase 2b: poll hid here */
     } else if (!strcmp(name, "shim_exit_nhwindows")) {
@@ -798,7 +1046,13 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
         nh3ds_refresh();
         if (blocking) {
             if ((ty == NHW_MENU || ty == NHW_TEXT) && w == nh3ds_pop_win) {
-                nh3ds_draw_popup();
+                if (nh3ds_menu.active && nh3ds_menu.win == w
+                    && nh3ds_menu.n > 0) {
+                    /* a menu that is displayed rather than selected */
+                    nh3ds_menu_render(-1);
+                } else {
+                    nh3ds_draw_popup();
+                }
                 nh3ds_wait_button();
                 nh3ds_draw_bot_msgs();
             } else {
@@ -811,6 +1065,8 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
 
         if (w == nh3ds_pop_win)
             nh3ds_pop_win = -1;
+        if (nh3ds_menu.win == w)
+            nh3ds_menu.active = FALSE;
         if (w > 0 && w < NH3DS_MAXWINID)
             nh3ds_wintype[w] = 0;
     } else if (!strcmp(name, "shim_curs")) {
@@ -832,41 +1088,76 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
     } else if (!strcmp(name, "shim_display_file")) {
         nh3ds_log("[display_file] %s", args[0].s ? args[0].s : "");
     } else if (!strcmp(name, "shim_start_menu")) {
-        /* nothing yet (phase 2c: menu buffering per winid) */
+        winid w = (winid) args[0].i;
+
+        if (w > 0 && w < NH3DS_MAXWINID
+            && nh3ds_wintype[w] - 1 == NHW_MENU) {
+            nh3ds_menu.win = w;
+            nh3ds_menu.active = TRUE;
+            nh3ds_menu.n = 0;
+            nh3ds_menu.top = 0;
+            nh3ds_menu.prompt[0] = '\0';
+        }
     } else if (!strcmp(name, "shim_add_menu")) {
-        /* phase 2c: real menu items; phase 2a: append "ch) str" to the
-         * popup text so blocking menus are readable.  fmt is
-         * "vipi00iisi": 0=win, 2=identifier, 3=ch, 6=clr, 7=str,
-         * 8=itemflags (the shim forwards plain varargs). */
+        /* fmt "vipi00iisi": 0=win, 2=identifier (pointer bits in an int
+         * slot), 3=ch, 4=gch, 5=attr, 6=clr, 7=str, 8=itemflags (the
+         * shim forwards plain varargs). */
         winid w = (winid) args[0].i;
         char ch = (char) args[3].i;
         const char *str = args[7].s ? args[7].s : "";
 
-        if (w == nh3ds_pop_win && nh3ds_pop_n < NH3DS_POPLINES) {
-            if (ch && ch != ' ')
-                (void) sprintf(nh3ds_pop_lines[nh3ds_pop_n], "%c) %s", ch,
-                               str);
-            else
-                (void) sprintf(nh3ds_pop_lines[nh3ds_pop_n], "  %s", str);
-            ++nh3ds_pop_n;
+        if (nh3ds_menu.active && w == nh3ds_menu.win
+            && nh3ds_menu.n < NH3DS_MAXMENU) {
+            struct nh3ds_menuitem *m = &nh3ds_menu.item[nh3ds_menu.n];
+
+            m->id = *(const ANY_P *) (const void *) (uintptr_t) args[2].i;
+            m->ch = ch;
+            m->gch = (char) args[4].i;
+            m->attr = args[5].i;
+            m->clr = args[6].i;
+            (void) strncpy(m->str, str, sizeof m->str - 1);
+            m->str[sizeof m->str - 1] = '\0';
+            m->itemflags = (unsigned) args[8].i;
+            ++nh3ds_menu.n;
         }
     } else if (!strcmp(name, "shim_end_menu")) {
         const char *prompt = args[1].s;
 
         if (prompt && *prompt) {
-            strncpy(nh3ds_pop_prompt, prompt, NH3DS_POPLINELEN - 1);
+            if (nh3ds_menu.active) {
+                (void) strncpy(nh3ds_menu.prompt, prompt,
+                               sizeof nh3ds_menu.prompt - 1);
+                nh3ds_menu.prompt[sizeof nh3ds_menu.prompt - 1] = '\0';
+            }
+            (void) strncpy(nh3ds_pop_prompt, prompt, NH3DS_POPLINELEN - 1);
             nh3ds_pop_prompt[NH3DS_POPLINELEN - 1] = '\0';
         }
     } else if (!strcmp(name, "shim_select_menu")) {
-        /* phase 2c: bottom-screen menu selection.  Until then: report
-         * "cancelled" (-1 == ESC).  Returning 0 would mean "empty menu,
-         * nothing selected"; core loops such as ask_do_tutorial()
-         * (options.c) re-issue the menu until they get a non-zero
-         * result, so 0 caused an infinite create_nhwindow flood
-         * (~6400/s).  -1 ends every such loop the ESC way. */
+        winid w = (winid) args[0].i;
+        int how = args[1].i;
+
         if (args[2].p)
             *(MENU_ITEM_P **) args[2].p = (MENU_ITEM_P *) 0;
-        rint = -1;
+        if (w != nh3ds_menu.win || !nh3ds_menu.active) {
+            rint = -1; /* stale or unbuffered window: cancelled */
+        } else if (how == PICK_NONE) {
+            /* display-only list: show it and wait for a key (tty-like) */
+            if (nh3ds_any_button_ever) {
+                nh3ds_menu_render(-1);
+                nh3ds_wait_button();
+            }
+            nh3ds_menu.active = FALSE;
+            rint = 0;
+        } else if (!nh3ds_any_button_ever) {
+            /* demo mode: cancel every interactive menu so unattended
+             * runs keep flowing */
+            nh3ds_menu.active = FALSE;
+            rint = -1;
+        } else {
+            rint = nh3ds_menu_pick(how, (MENU_ITEM_P **) args[2].p);
+            nh3ds_menu.active = FALSE;
+            nh3ds_log("[select_menu win=%d how=%d] -> %d", w, how, rint);
+        }
     } else if (!strcmp(name, "shim_message_menu")) {
         /* acknowledge the message (equivalent of pressing the key) */
         if (args[2].s)
@@ -946,6 +1237,10 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
         } else {
             /* real play: B = no/escape, A (or any action button) =
              * default / first allowed answer; directions are ignored */
+            nh3ds_scr(0);
+            printf("\x1b[2J\x1b[0m");
+            printf("\x1b[1;1H\x1b[37;1m%-40.40s", query);
+            printf("\x1b[2;1H\x1b[0m%-40.40s", "[A]=default [B]=no/esc");
             for (;;) {
                 int key = nh3ds_read_key();
                 char c = (char) key;
@@ -970,12 +1265,57 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
                       query, ans);
         }
     } else if (!strcmp(name, "shim_getlin")) {
-        /* cancel-style answer; phase 2c: software keyboard */
-        if (args[1].p)
+        const char *query = args[0].s ? args[0].s : "";
+
+        if (nh3ds_any_button_ever) {
+            /* real play: software keyboard; ESC/cancel -> "\033" */
+            if (nh3ds_swkbd(query, (char *) args[1].p, BUFSZ))
+                nh3ds_log("[getlin] %s -> \"%s\"", query,
+                          (char *) args[1].p);
+            else {
+                strcpy((char *) args[1].p, "\033");
+                nh3ds_log("[getlin] %s -> ESC", query);
+            }
+        } else {
             strcpy((char *) args[1].p, "\033");
-        nh3ds_log("[getlin] %s -> ESC", args[0].s ? args[0].s : "");
+            nh3ds_log("[getlin demo] %s -> ESC", query);
+        }
     } else if (!strcmp(name, "shim_get_ext_cmd")) {
-        rint = -1; /* cancelled */
+        if (nh3ds_any_button_ever) {
+            /* minimal reimplementation of the core's extcmd_via_menu()
+             * (that one is TTY/CURSES-only): a PICK_ONE menu of the
+             * available extended commands, driven through our own
+             * select_menu */
+            winid win;
+            menu_item *sel = (menu_item *) 0;
+            anything any;
+            const struct ext_func_tab *efp;
+            int n = 0;
+
+            win = create_nhwindow(NHW_MENU);
+            start_menu(win, MENU_BEHAVE_STANDARD);
+            for (efp = extcmdlist; efp->ef_txt; ++efp) {                if ((efp->flags & (CMD_NOT_AVAILABLE | INTERNALCMD))
+                    || !(efp->flags & AUTOCOMPLETE)
+                    || (!wizard && (efp->flags & WIZMODECMD)))
+                    continue;
+                any = cg.zeroany;
+                any.a_int = n + 1;
+                add_menu(win, &nul_glyphinfo, &any, 0, 0, ATR_NONE,
+                         NO_COLOR, efp->ef_txt, MENU_ITEMFLAGS_NONE);
+                ++n;
+            }
+            end_menu(win, "What extended command?");
+            if (select_menu(win, PICK_ONE, &sel) > 0 && sel) {
+                rint = sel[0].item.a_int - 1;
+                free((genericptr_t) sel);
+            } else {
+                rint = -1;
+            }
+            destroy_nhwindow(win);
+            nh3ds_log("[get_ext_cmd] -> %d", rint);
+        } else {
+            rint = -1; /* demo mode: cancelled */
+        }
     } else if (!strcmp(name, "shim_number_pad")) {
         /* nothing */
     } else if (!strcmp(name, "shim_delay_output")) {
