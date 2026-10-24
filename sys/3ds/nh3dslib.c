@@ -86,6 +86,26 @@ creat(const char *path, mode_t mode)
     return open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
 }
 
+/* No advisory file locking on the 3DS (libsysbase's fcntl() rejects
+ * F_SETLK, which made lock_file() on the "perm" lock give up after 10
+ * retries).  The 3DS runs a single game process, so pretending every
+ * lock attempt succeeds preserves the upstream USE_FCNTL code path
+ * (unixconf.h defines USE_FCNTL whenever POSIX_TYPES is set).  Other
+ * fcntl commands never occur in this binary. */
+int
+fcntl(int fd, int cmd, ...)
+{
+    (void) fd;
+    switch (cmd) {
+    case F_SETLK:
+    case F_SETLKW:
+    case F_UNLCK:
+        return 0;
+    default:
+        return -1;
+    }
+}
+
 /* ----------------------------------------------------------------------*/
 /* process bits that cannot exist on the 3DS                              */
 /* ----------------------------------------------------------------------*/
