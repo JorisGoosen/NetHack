@@ -26,6 +26,17 @@ override TARGETPFX = $(TARGETDIR)/
 override TARGET_LIBS=
 endif
 
+ifdef CROSS_TO_3DS
+CROSS=1
+BUILD_TARGET_LUA=1
+HACKDIR=sdmc:/3ds/nethack
+PREFIX=
+override TARGET = 3ds
+override TARGETDIR=../targets/$(TARGET)
+override TARGETPFX = $(TARGETDIR)/
+override TARGET_LIBS=
+endif
+
 ifdef CROSS_TO_MIPS
 CROSS=1
 BUILD_TARGET_LUA=1

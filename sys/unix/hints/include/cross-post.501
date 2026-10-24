@@ -185,6 +185,67 @@ $(TARGETPFX)libnhmain.o : ../sys/libnh/libnhmain.c $(HACK_H)
 endif  # CROSS_TO_WASM
 
 #
+ifdef CROSS_TO_3DS
+# object dependencies -- recipes come from cross-pre2 / Makefile.src
+$(TARGETPFX)libnhmain.o : ../sys/libnh/libnhmain.c $(HACK_H)
+$(TARGETPFX)unixunix.o : ../sys/unix/unixunix.c $(HACK_H)
+$(TARGETPFX)winshim.o : ../win/shim/winshim.c $(HACK_H)
+$(TARGETPFX)nh3ds.o : ../sys/3ds/nh3ds.c $(HACK_H)
+$(TARGETPFX)nh3dslib.o : ../sys/3ds/nh3dslib.c $(HACK_H)
+
+3DS_DATA_DIR = $(TARGETPFX)3ds-data
+3DS_TARGET = $(TARGETPFX)NetHack3ds.3dsx
+
+# SYSOBJ (nh3ds.o, nh3dslib.o, winshim.o, libnhmain.o, unixunix.o) and
+# REGEXOBJ (cppregex.o) are already part of HOBJ, and LUACROSSLIB rides
+# in TARGET_LIBS (see cross-pre2), so the link line only needs to add
+# date.o and the core archive.
+$(TARGETPFX)NetHack3ds.elf: pregame $(TARGET_HACKLIB) \
+		$(TARGETPFX)date.o $(HOSTOBJ) $(HOBJ) $(LUACROSSLIB) \
+		$(3DS_DATA_DIR)
+	-rm $@
+	$(TARGET_LINK) -specs=3dsx.specs $(TARGET_LFLAGS) -o $@ \
+		$(HOBJ) $(TARGETPFX)date.o $(TARGET_HACKLIB) \
+		$(TARGET_LIBS)
+
+$(3DS_TARGET): $(TARGETPFX)NetHack3ds.elf
+	$(DEVKITPRO)/tools/bin/3dsxtool $< $@
+
+$(3DS_DATA_DIR): $(3DS_DATA_DIR)/nhdat
+	touch $(3DS_DATA_DIR)/perm $(3DS_DATA_DIR)/record \
+		$(3DS_DATA_DIR)/logfile $(3DS_DATA_DIR)/xlogfile
+	cp ../sys/libnh/sysconf $(3DS_DATA_DIR)/sysconf
+
+$(3DS_DATA_DIR)/nhdat:
+	( cd ..; $(MAKE) INSTDIR='$(3DS_DATA_DIR)' $(3DSDEP) dofiles-dlb )
+
+.PHONY: 3dspkg
+ifdef MAKEFILE_TOP
+# the pkg rules below use src-relative paths; delegate to the src make
+3dspkg:
+	( cd src ; $(MAKE) CROSS_TO_3DS=1 3dspkg )
+else
+# Fresh pkg and ZIP: playing from pkg leaves saves, levels and scores
+# there that must not be packaged (cf. amigapkg/ataripkg).
+3dspkg: $(3DS_TARGET) $(3DS_DATA_DIR)
+	rm -rf $(TARGETPFX)pkg
+	rm -f $(TARGETPFX)nh$(NHV)3ds.zip
+	mkdir -p $(TARGETPFX)pkg/nethack
+	cp $(3DS_TARGET) $(TARGETPFX)pkg/
+	cp $(3DS_DATA_DIR)/nhdat $(3DS_DATA_DIR)/sysconf \
+		$(TARGETPFX)pkg/nethack/
+	touch $(TARGETPFX)pkg/nethack/record \
+		$(TARGETPFX)pkg/nethack/logfile $(TARGETPFX)pkg/nethack/perm
+	cp ../sys/3ds/defaults.nh $(TARGETPFX)pkg/nethack/defaults.nh
+	cp ../sys/3ds/defaults.nh $(TARGETPFX)pkg/nethack/.nethackrc
+	cp ../dat/license ../dat/symbols $(TARGETPFX)pkg/nethack/
+	cp ../sys/3ds/README.3ds $(TARGETPFX)pkg/
+	cd $(TARGETPFX)pkg && zip -9r ../nh$(NHV)3ds.zip *
+	@echo 3DS package zip file $(TARGETPFX)nh$(NHV)3ds.zip
+endif  # MAKEFILE_TOP
+endif  # CROSS_TO_3DS
+#
+#
 ifdef CROSS_TO_MIPS
 $(MIPS_TARGET): pregame $(TARGETPFX)date.o $(HOSTOBJ) $(HOBJ) $(LUACROSSLIB) \
 			$(TARGETPFX)ncurses/lib/libncurses.a \

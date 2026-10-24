@@ -1,0 +1,25 @@
+NetHack 5.0.1 for Nintendo 3DS
+==============================
+
+Install
+-------
+Copy the contents of the "nethack" folder in this package to
+    sdmc:/3ds/nethack/
+on the 3DS SD card, and copy NetHack3ds.3dsx anywhere the Homebrew
+Launcher can see it (e.g. sdmc:/3ds/NetHack3ds.3dsx).  The game keeps
+its data files (nhdat, sysconf, record, save files, bones, ...) in
+sdmc:/3ds/nethack, so that folder must be writable.
+
+Play
+----
+Launch the Homebrew Loader and start NetHack3ds.
+
+The current phase ships a stub front-end: the game boots, creates a
+character (random role) and sits in the main game loop resting one turn
+at a time.  Diagnostics are written to sdmc:/3ds/nethack/nh3ds.log and
+to the top screen.  Real map rendering and input arrive with the next
+phase; see sys/3ds/PLAN.md in the source distribution for the roadmap.
+
+Building from source
+--------------------
+See sys/unix/README.hints ("CROSS_TO_3DS") and sys/3ds/PLAN.md.

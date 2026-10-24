@@ -1,0 +1,13 @@
+# NetHack 5.0.1 for Nintendo 3DS -- player configuration
+#
+# This file is installed both as "defaults.nh" and as ".nethackrc" in
+# sdmc:/3ds/nethack: on the UNIX configuration the game reads
+# .nethackrc (defaults.nh is only consulted by the MSDOS/Windows
+# configurations), and with no HOME on the 3DS the relative name
+# resolves to the playground directory.
+#
+# The interface is the built-in "shim" windowport driven by the 3DS
+# front-end; windowtype is baked in and cannot be changed here.
+
+# keep a permanent inventory list available for the inventory screen
+OPTIONS=perm_invent

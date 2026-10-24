@@ -55,6 +55,15 @@ make resp=1                   Place the majority of the compiler switches into
 make CROSS_TO_MSDOS=1 package Cross-compile for an MSDOS target package.
 make CROSS_TO_WASM=1          Cross-compile for a WASM target.
 make CROSS_TO_MIPS=1          Cross-compile for a mips target.
+make CROSS_TO_3DS=1           Cross-compile for a Nintendo 3DS homebrew
+                              (.3dsx) target.  Requires devkitPro's
+                              devkitARM and libctru; set DEVKITPRO and
+                              DEVKITARM in the environment first (e.g.
+                              'source /opt/devkitpro/env.sh').  After
+                              building, 'make CROSS_TO_3DS=1 3dspkg'
+                              produces targets/3ds/nh5013ds.zip with the
+                              .3dsx plus the files to install into
+                              sdmc:/3ds/nethack on the SD card.
 
 make WANT_BUNDLE=1            For macOS.501 only, place the build results into
                               a macOS bundle layout.

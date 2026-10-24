@@ -424,6 +424,117 @@ $(TARGETPFX)%.o : ../win/shim/%.c
 endif  # CROSS_TO_WASM
 
 
+ifdef CROSS_TO_3DS
+#=================================================================
+# Nintendo 3DS cross-compile recipe (devkitARM + libctru)
+#=================================================================
+# Uses devkitARM + libctru on a linux or macOS host.
+#
+# 1. Install devkitPro with the 3ds-dev group (devkitARM, libctru,
+#    3dstools) and set up the environment:
+#        export DEVKITPRO=/opt/devkitpro
+#        export DEVKITARM=$DEVKITPRO/devkitARM
+# 2. Then
+#     sys/unix/setup.sh sys/unix/hints/linux.501   # or macOS.501
+#     make CROSS_TO_3DS=1 all
+#     make CROSS_TO_3DS=1 3dspkg
+#
+# Toolchain facts (verified against devkitARM 16.1.0 / libctru 2.7.0):
+#  - hard-float ABI is mandatory: -mfloat-abi=hard -mtp=soft
+#    -mword-relocations.  3dsx_crt0.o and libctru exist only for the
+#    hard-float multilib; softfp does not link.
+#  - __3DS__ is not predefined by the compiler; pass it explicitly.
+#  - -specs=3dsx.specs is found by name (arm-none-eabi/lib/<multilib>/);
+#    -L$(LIBCTRU)/lib must be explicit -- libctru ships no .pc file.
+#  - the link must carry the same $(3DS_ARCH) so that the armv6k/fpu
+#    multilib (3dsx_crt0.o, libc, libstdc++) is selected.
+#  - devkitARM's newlib lacks regex(3) and getlogin/getpw*/getuid, so
+#    this build links cppregex.o (libstdc++, CPLUSPLUS_NEEDED) and
+#    sys/3ds/nh3dslib.c.
+#  - devkitARM's GCC 16 defaults to C23, which breaks savefile.h's
+#    _Generic save dispatch (see the mac68k notes); force -std=gnu17.
+#=================================================================
+
+# The host setup exports DEVKITPRO/DEVKITARM (devkitpro env.sh);
+# these ?= defaults are only fallbacks:
+DEVKITPRO ?= /opt/devkitpro
+DEVKITARM ?= $(DEVKITPRO)/devkitARM
+LIBCTRU   ?= $(DEVKITPRO)/libctru
+ifeq "$(DEVKITARM)" ""
+$(error CROSS_TO_3DS requires devkitPro; set DEVKITPRO/DEVKITARM)
+endif
+
+override TARGET_CC   = $(DEVKITARM)/bin/arm-none-eabi-gcc
+override TARGET_CXX  = $(DEVKITARM)/bin/arm-none-eabi-g++
+override TARGET_AR   = $(DEVKITARM)/bin/arm-none-eabi-ar
+# cppregex needs libstdc++; link with g++ so it is picked up
+CPLUSPLUS_NEEDED = 1
+ifdef CPLUSPLUS_NEEDED
+override TARGET_LINK = $(DEVKITARM)/bin/arm-none-eabi-g++
+else
+override TARGET_LINK = $(DEVKITARM)/bin/arm-none-eabi-gcc
+endif
+
+3DS_ARCH = -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
+3DS_CFLAGS = -c -O2 $(3DS_ARCH) -mword-relocations -std=gnu17 \
+	-fomit-frame-pointer \
+	-ffunction-sections -fdata-sections \
+	-I../include -I../nhlua/lua/src -I$(LIBCTRU)/include \
+	$(LUAINCL) $(WINCFLAGS) \
+	-DSYSCF -DSYSCF_FILE=\"sysconf\" -DNONHUUID \
+	-DDLB -DHACKDIR=\"$(HACKDIR)\" -DDEFAULT_WINDOW_SYS=\"shim\" \
+	-DNOMAIL -DNO_SIGNAL -DNO_FILE_LINKS -DNOTTYGRAPHICS \
+	-DNOSUSPEND -DNOSHELL \
+	-DSHIM_GRAPHICS -DLIBNH -DNOPANICTRACE \
+	-DCROSSCOMPILE -DCROSSCOMPILE_TARGET -DCROSS_TO_3DS -D__3DS__ \
+	-Wall -Wextra -Wno-missing-field-initializers -Wreturn-type \
+	-Wunused -Wformat -Wswitch -Wshadow
+override TARGET_CFLAGS = $(3DS_CFLAGS)
+LUA_TARGET_CFLAGS = $(TARGET_CFLAGS)
+# C++ (cppregex.cpp): g++ ignores -std=gnu17; force a C++ standard and
+# make include/integer.h use the compiler's <stdint.h> (its manual
+# int32_t/uint32_t typedefs conflict with the one <stdint.h> that
+# libstdc++ pulls in)
+override TARGET_CXXFLAGS = $(TARGET_CFLAGS) -DHAS_STDINT_H -std=gnu++17
+override TARGET_LFLAGS = $(3DS_ARCH) -mword-relocations -L$(LIBCTRU)/lib
+override TARGET_LIBS += -lctru -lm
+
+override REGEXOBJ = $(TARGETPFX)cppregex.o
+override SYSSRC = ../sys/libnh/libnhmain.c \
+	../sys/unix/unixunix.c \
+	../win/shim/winshim.c \
+	../sys/3ds/nh3ds.c ../sys/3ds/nh3dslib.c
+override SYSOBJ = $(TARGETPFX)libnhmain.o $(TARGETPFX)unixunix.o \
+	$(TARGETPFX)winshim.o \
+	$(TARGETPFX)nh3ds.o $(TARGETPFX)nh3dslib.o
+override WINLIB=
+override LUALIB=
+override LUALIBS=
+override LUATOPLIB=
+override WINOBJ=
+override UUIDOBJ=
+override DLLIB=
+# don't bother Making a host NetHack executable
+override GAME=
+override GAMEBIN = $(TARGETPFX)NetHack3ds.3dsx
+3DS_DAT = bogusmon data engrave epitaph oracles quest.lua rumors
+3DSDEP = include/nhlua.h $(3DS_DAT) spec_levs check-dlb
+override ALLDEP = $(3DSDEP) 3ds
+override PREGAME += mkdir -p $(TARGETDIR) $(TARGETPFX)3ds-data ;
+override CLEANMORE += rm -rf $(TARGETDIR) ;
+#
+# Rules for files outside of src/ -- the core object rules (posixregex.o,
+# unixunix.o, winshim.o, ...) already exist in Makefile.src
+#
+$(TARGETPFX)%.o : ../sys/libnh/%.c
+	$(TARGET_CC) $(TARGET_CFLAGS) -c -o$@ $<
+$(TARGETPFX)%.o : ../sys/3ds/%.c
+	$(TARGET_CC) $(TARGET_CFLAGS) -c -o$@ $<
+# cppregex.o uses the explicit rule already present in Makefile.src
+endif  # CROSS_TO_3DS
+#=================================================================
+
+
 ifdef CROSS_TO_MIPS
 #================================================================
 # MIPS cross-compile recipe
