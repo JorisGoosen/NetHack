@@ -358,17 +358,46 @@ nh3ds_draw_messages(void)
     nh3ds_msg_dirty = FALSE;
 }
 
-/* append one message line to the ring */
+/* append one message line to the ring; word-wrap s at the bottom-screen
+ * width (40) so long messages stay readable on both screens instead of
+ * being truncated */
 static void
 nh3ds_msg_add(const char *s)
 {
+    char buf[NH3DS_MSGLEN];
+    const char *p;
+
     if (!s)
         s = "";
-    strncpy(nh3ds_msgs[nh3ds_msg_head], s, NH3DS_MSGLEN - 1);
-    nh3ds_msgs[nh3ds_msg_head][NH3DS_MSGLEN - 1] = '\0';
-    nh3ds_msg_head = (nh3ds_msg_head + 1) % NH3DS_NMSGS;
-    if (nh3ds_msg_count < NH3DS_NMSGS)
-        ++nh3ds_msg_count;
+    (void) strncpy(buf, s, NH3DS_MSGLEN - 1);
+    buf[NH3DS_MSGLEN - 1] = '\0';
+    p = buf;
+    while (*p) {
+        char chunk[BOT_COLS + 1];
+        int len = (int) strlen(p);
+        const char *cut;
+
+        if (len <= BOT_COLS) {
+            cut = p + len;
+        } else {
+            cut = p + BOT_COLS; /* break at the last space in range */
+            while (cut > p && *cut != ' ')
+                --cut;
+            if (cut == p)       /* no space at all: hard break */
+                cut = p + BOT_COLS;
+        }
+        len = (int) (cut - p);
+        memcpy(chunk, p, (size_t) len);
+        chunk[len] = '\0';
+        p = cut;
+        while (*p == ' ')
+            ++p;
+        strncpy(nh3ds_msgs[nh3ds_msg_head], chunk, NH3DS_MSGLEN - 1);
+        nh3ds_msgs[nh3ds_msg_head][NH3DS_MSGLEN - 1] = '\0';
+        nh3ds_msg_head = (nh3ds_msg_head + 1) % NH3DS_NMSGS;
+        if (nh3ds_msg_count < NH3DS_NMSGS)
+            ++nh3ds_msg_count;
+    }
     nh3ds_msg_dirty = TRUE;
 }
 
@@ -485,8 +514,8 @@ nh3ds_draw_status(void)
 static const char *const nh3ds_legend[TOP_ROWS - LEG_ROW0] = {
     "pad=hjkl 2=diag L+pad=run R+pad=travel",
     "A=rest B=inv X=grab Y=search L=shift",
-    "START=save SELECT=help",
-    "NetHack 3DS",
+    "START=save SELECT=help touch=buttons",
+    "k:keys = full keyboard digits ^cmds",
 };
 
 static void
@@ -695,58 +724,68 @@ nh3ds_tap(int *tcol, int *trow)
     return *tcol >= 0;
 }
 
-/* verb buttons: below the message tail during play -- 4 rows x 5
+/* verb buttons: below the message tail during play -- 5 rows x 5
  * columns of 8x2-cell buttons (label row + spacer row, one gap row
- * between button rows).  Kick is ^D; locking/unlocking a door is
- * apply-a-key/lockpick ('a') or #force via the command menu. */
+ * between button rows).  Kick is ^D; force opens the command menu
+ * pre-filtered on "force" (it needs a wielded blade); k opens the
+ * full keys overlay (digits, ^letters, all punctuation). */
 #define TBOT_ROW0 15            /* 0-based console row of the first button */
 #define TBOT_STEP 3             /* 2-row button + 1 gap row */
 #define TBOT_COLW 8
+#define NH3DS_VKEY_KEYS 0x100   /* sentinel: open the keys overlay */
 struct nh3ds_verb {
     int key;
     const char label[9];
+    const char *pre;            /* ext-menu prefill, or 0 */
 };
 static const struct nh3ds_verb nh3ds_verbs[] = {
-    { 'a', "a:apply " }, { 'o', "o:open  " }, { 'c', "c:close " },
-    { 0x04, "^D:kick " }, { 'q', "q:quaff " },
-    { 'z', "z:zap   " }, { 'Z', "Z:spell " }, { 'e', "e:eat   " },
-    { 'r', "r:read  " }, { 'w', "w:wield " },
-    { 't', "t:throw " }, { 'f', "f:fire  " }, { 'd', "d:drop  " },
-    { 'W', "W:wear  " }, { 'P', "P:puton " },
-    { 'T', "T:tkoff " }, { 'R', "R:rmv   " }, { 'C', "C:call  " },
-    { '*', "*:equip " }, { '#', "#:cmd   " },
+    { 'a', "a:apply ", 0 }, { 'o', "o:open  ", 0 }, { 'c', "c:close ", 0 },
+    { 0x04, "^D:kick ", 0 }, { 'q', "q:quaff ", 0 },
+    { 'z', "z:zap   ", 0 }, { 'Z', "Z:spell ", 0 }, { 'e', "e:eat   ", 0 },
+    { 'r', "r:read  ", 0 }, { 'w', "w:wield ", 0 },
+    { 't', "t:throw ", 0 }, { 'f', "f:fire  ", 0 }, { 'd', "d:drop  ", 0 },
+    { 'W', "W:wear  ", 0 }, { 'P', "P:puton ", 0 },
+    { 'T', "T:tkoff ", 0 }, { 'R', "R:rmv   ", 0 }, { 'C', "C:call  ", 0 },
+    { '*', "*:equip ", 0 }, { '#', "#:cmd   ", 0 },
+    { '>', ">:down  ", 0 }, { '<', "<:up    ", 0 },
+    { '#', "F:force ", "force" },
+    { NH3DS_VKEY_KEYS, "k:keys  ", 0 },
+    { 'm', "m:sneak ", 0 },
 };
 
-/* key for the verb button under a tapped cell, or 0 */
+/* ext-menu prefill queued by the F:force verb button */
+static const char *nh3ds_ext_prefill;
+
+/* index of the verb button under a tapped cell, or -1 */
 static int
 nh3ds_verb_at(int cx, int cy)
 {
     int r, c;
 
-    if (cy < TBOT_ROW0 || cy >= TBOT_ROW0 + 4 * TBOT_STEP)
-        return 0;
+    if (cy < TBOT_ROW0 || cy >= TBOT_ROW0 + 5 * TBOT_STEP)
+        return -1;
     if ((cy - TBOT_ROW0) % TBOT_STEP >= 2)
-        return 0; /* gap row between button rows */
+        return -1; /* gap row between button rows */
     r = (cy - TBOT_ROW0) / TBOT_STEP;
     c = cx / TBOT_COLW;
     if (c >= 5)
-        return 0;
-    return nh3ds_verbs[r * 5 + c].key;
+        return -1;
+    return r * 5 + c;
 }
 
-/* draw the verb grid + a hint line (bottom screen rows 16..28) */
+/* draw the verb grid + a hint line (bottom screen rows 16..30) */
 static void
 nh3ds_bot_buttons(void)
 {
     int r, c;
 
     nh3ds_scr(0);
-    for (r = 0; r < 4; ++r)
+    for (r = 0; r < 5; ++r)
         for (c = 0; c < 5; ++c)
             printf("\x1b[%d;%dH\x1b[7m%-8.8s\x1b[0m",
                    TBOT_ROW0 + r * TBOT_STEP + 1, c * TBOT_COLW + 1,
                    nh3ds_verbs[r * 5 + c].label);
-    printf("\x1b[28;1H\x1b[36m%-40.40s",
+    printf("\x1b[30;1H\x1b[36m%-40.40s",
            "L=shift R=travel  tap a button");
 }
 
@@ -774,22 +813,31 @@ static const struct nh3ds_key nh3ds_keys[] = {
 static void
 nh3ds_kbd_render(void)
 {
-    int r, c;
+    int r, c, i;
 
     nh3ds_scr(0);
     for (r = 0; r < 3; ++r)
-        for (c = 0; c < 10; ++c)
-            printf("\x1b[%d;%dH\x1b[7m %c \x1b[0m",
-                   KBD_ROW0 + r * KBD_STEP + 3, c * KBD_COLW + 1,
-                   nh3ds_keys[r * 10 + c].base);
-    printf("\x1b[29;1H\x1b[36m%-40.40s", "L=shift");
+        for (c = 0; c < 10; ++c) {
+            const struct nh3ds_key *k = &nh3ds_keys[r * 10 + c];
+            int row0 = KBD_ROW0 + r * KBD_STEP + 1;
+
+            /* blue border rows top+bottom, blue left edge on the face
+             * rows: each key draws its whole 4x5-cell area */
+            printf("\x1b[%d;%dH\x1b[44m    \x1b[0m", row0, c * KBD_COLW + 1);
+            printf("\x1b[%d;%dH\x1b[44m    \x1b[0m", row0 + KBD_STEP - 1,
+                   c * KBD_COLW + 1);
+            for (i = 1; i < KBD_STEP - 1; ++i)
+                printf("\x1b[%d;%dH\x1b[44m \x1b[7m %c \x1b[0m",
+                       row0 + i, c * KBD_COLW + 1, k->base);
+        }
+    printf("\x1b[29;1H\x1b[36m%-40.40s", "L=shift R=ctrl");
 }
 
-/* character under a tapped cell (shift applied), or 0 */
+/* character under a tapped cell (L = shift, R = ctrl applied), or 0 */
 static int
 nh3ds_kbd_map(int cx, int cy)
 {
-    int r, c, i;
+    int r, c, i, ch;
 
     if (cy < KBD_ROW0 || cy >= KBD_ROW0 + 3 * KBD_STEP)
         return 0;
@@ -798,8 +846,10 @@ nh3ds_kbd_map(int cx, int cy)
     i = r * 10 + c;
     if (c >= 10 || i >= 30)
         return 0;
-    return (hidKeysHeld() & KEY_L) ? nh3ds_keys[i].shifted
-                                   : nh3ds_keys[i].base;
+    ch = (hidKeysHeld() & KEY_L) ? nh3ds_keys[i].shifted : nh3ds_keys[i].base;
+    if (hidKeysHeld() & KEY_R)
+        ch &= 0x1f; /* ctrl */
+    return ch;
 }
 
 /* print s word-wrapped into the detail pane above the keyboard */
@@ -834,6 +884,82 @@ nh3ds_detail(const char *s)
 }
 
 /* ----------------------------------------------------------------------*/
+/* keys overlay: full bottom-screen keyboard during play                  */
+/* ----------------------------------------------------------------------*/
+
+/* Five rows x 10 keys of 4x4-cell blocks: digits, the qwerty rows,
+ * then NetHack specials ('>' '<' '^' '_' '$' '\' '=' '@' '!' and Esc
+ * shown as "Es").  L = shift, R = ctrl, B closes; the newest messages
+ * stay visible below so the prompt being answered can be read. */
+static boolean nh3ds_keys_open;
+#define OV_ROW0 2               /* 0-based console row of the first key */
+#define OV_STEP 4
+static const char nh3ds_ov_rows[5][11] = {
+    "1234567890",
+    "qwertyuiop",
+    "asdfghjkl;",
+    "zxcvbnm,./",
+    "><^_$\\=@!\033",
+};
+
+static void
+nh3ds_overlay_draw(void)
+{
+    int r, c, i, n, oldest;
+
+    nh3ds_scr(0);
+    printf("\x1b[2J\x1b[0m");
+    printf("\x1b[1;1H\x1b[36m%-40.40s",
+           "L=shift R=ctrl B=close tap=key");
+    for (r = 0; r < 5; ++r)
+        for (c = 0; c < 10; ++c) {
+            char k = nh3ds_ov_rows[r][c];
+            int row0 = OV_ROW0 + r * OV_STEP + 1;
+
+            printf("\x1b[%d;%dH\x1b[44m    \x1b[0m", row0, c * 4 + 1);
+            printf("\x1b[%d;%dH\x1b[44m    \x1b[0m", row0 + OV_STEP - 1,
+                   c * 4 + 1);
+            for (i = 1; i < OV_STEP - 1; ++i) {
+                if (k == '\033')
+                    printf("\x1b[%d;%dH\x1b[44m \x1b[7m Es \x1b[0m",
+                           row0 + i, c * 4 + 1);
+                else
+                    printf("\x1b[%d;%dH\x1b[44m \x1b[7m %c \x1b[0m",
+                           row0 + i, c * 4 + 1, k);
+            }
+        }
+    /* newest messages below the keys */
+    n = (nh3ds_msg_count < 6) ? nh3ds_msg_count : 6;
+    oldest = (nh3ds_msg_head - nh3ds_msg_count + NH3DS_NMSGS) % NH3DS_NMSGS;
+    oldest = (oldest + nh3ds_msg_count - n) % NH3DS_NMSGS;
+    for (i = 0; i < n; ++i)
+        printf("\x1b[%d;1H\x1b[0m%-40.40s", OV_ROW0 + 5 * OV_STEP + 1 + i,
+               nh3ds_msgs[(oldest + i) % NH3DS_NMSGS]);
+}
+
+/* character under a tapped overlay cell (L/R applied), or 0 */
+static int
+nh3ds_overlay_map(int cx, int cy)
+{
+    int r, c, ch;
+
+    if (cy < OV_ROW0 || cy >= OV_ROW0 + 5 * OV_STEP)
+        return 0;
+    r = (cy - OV_ROW0) / OV_STEP;
+    c = cx / 4;
+    if (c >= 10)
+        return 0;
+    if (r >= 1 && r <= 3) /* qwerty rows share the menu keyboard table */
+        ch = (hidKeysHeld() & KEY_L) ? nh3ds_keys[(r - 1) * 10 + c].shifted
+                                     : nh3ds_keys[(r - 1) * 10 + c].base;
+    else
+        ch = nh3ds_ov_rows[r][c];
+    if ((hidKeysHeld() & KEY_R) && ch != '\033')
+        ch &= 0x1f; /* ctrl */
+    return ch;
+}
+
+/* ----------------------------------------------------------------------*/
 /* hid input (phase 2b)                                                   */
 /* ----------------------------------------------------------------------*/
 
@@ -864,6 +990,33 @@ nh3ds_next_key(void) /* 0 = nothing to report this frame */
     held = hidKeysHeld(); /* KEY_UP.. include the circle pad */
     btns = held & (KEY_A | KEY_B | KEY_X | KEY_Y | KEY_START | KEY_SELECT);
     dir = held & (KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT);
+
+    if (nh3ds_keys_open) {
+        /* keys overlay: taps type characters, B closes, the rest of
+         * the pad is ignored while the overlay owns the bottom screen */
+        int tcol, trow;
+
+        if (nh3ds_tap(&tcol, &trow)) {
+            int ch = nh3ds_overlay_map(tcol, trow);
+
+            if (ch) {
+                nh3ds_any_button_ever = TRUE;
+                last_key = 0;
+                last_mask = 0;
+                frames_since = 0;
+                return ch;
+            }
+            return 0;
+        }
+        if (btns & KEY_B) {
+            nh3ds_keys_open = FALSE;
+            nh3ds_draw_bot_msgs();
+        }
+        last_key = 0;
+        last_mask = 0;
+        frames_since = 0;
+        return 0;
+    }
 
     if (dir) {
         if ((dir & KEY_UP) && (dir & KEY_LEFT))
@@ -915,13 +1068,23 @@ nh3ds_next_key(void) /* 0 = nothing to report this frame */
         int tcol, trow;
 
         if (nh3ds_tap(&tcol, &trow)) {
-            key = nh3ds_verb_at(tcol, trow);
-            if (key) {
-                last_key = key;
+            int vi = nh3ds_verb_at(tcol, trow);
+
+            if (vi >= 0) {
+                const struct nh3ds_verb *v = &nh3ds_verbs[vi];
+
+                nh3ds_any_button_ever = TRUE;
+                last_key = 0;
                 last_mask = 0;
                 frames_since = 0;
-                nh3ds_any_button_ever = TRUE;
-                return key; /* touch verb: edge-triggered */
+                if (v->key == NH3DS_VKEY_KEYS) {
+                    nh3ds_keys_open = TRUE;
+                    nh3ds_overlay_draw();
+                    return 0;
+                }
+                if (v->pre)
+                    nh3ds_ext_prefill = v->pre;
+                return v->key;
             }
         }
         last_key = 0;
@@ -1021,6 +1184,8 @@ nh3ds_menu_render(int cursor)
         nh3ds_scr(0);
         printf("\x1b[2J\x1b[0m\x1b[29;1H\x1b[0m%-40.40s", "[A] continue");
     } else {
+        nh3ds_scr(0);
+        printf("\x1b[2J\x1b[0m");
         nh3ds_kbd_render();
         nh3ds_detail(nh3ds_menu.item[cursor].str);
     }
@@ -1051,7 +1216,7 @@ nh3ds_menu_input(int *tcol, int *trow)
                 *tcol = tc;
                 *trow = tr;
                 nh3ds_any_button_ever = TRUE;
-                return 0; /* tap: caller reads *tcol/*trow */
+                return 0; /* tap: caller reads *tcol / *trow */
             }
             down = hidKeysDown();
             if (down)
@@ -1230,6 +1395,13 @@ nh3ds_ext_menu(void)
     if (!n)
         return -1;
     filter[0] = '\0';
+    nh3ds_keys_open = FALSE; /* the menu owns the bottom screen now */
+    if (nh3ds_ext_prefill) { /* F:force verb button queued a filter */
+        (void) strncpy(filter, nh3ds_ext_prefill, sizeof filter - 1);
+        filter[sizeof filter - 1] = '\0';
+        flen = (int) strlen(filter);
+        nh3ds_ext_prefill = 0;
+    }
 
     for (;;) {
         int match[NH3DS_EXTMAX];
@@ -1275,6 +1447,8 @@ nh3ds_ext_menu(void)
 
         /* bottom screen: description of the highlighted command over
          * the letter keyboard */
+        nh3ds_scr(0);
+        printf("\x1b[2J\x1b[0m");
         nh3ds_detail(nm ? (extcmdlist[match[cursor]].ef_desc
                            ? extcmdlist[match[cursor]].ef_desc
                            : extcmdlist[match[cursor]].ef_txt)
@@ -1472,6 +1646,7 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
 
         nh3ds_refresh();
         if (blocking) {
+            nh3ds_keys_open = FALSE; /* the popup owns the bottom now */
             if ((ty == NHW_MENU || ty == NHW_TEXT) && w == nh3ds_pop_win) {
                 if (nh3ds_menu.active && nh3ds_menu.win == w
                     && nh3ds_menu.n > 0) {
@@ -1626,8 +1801,10 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
         }
     } else if (!strcmp(name, "shim_raw_print")
                || !strcmp(name, "shim_raw_print_bold")) {
-        /* error()/panic() surface here -- always show and log */
-        printf("%s\n", args[0].s ? args[0].s : "");
+        /* error()/panic() surface here -- into the wrapped message ring
+         * (a raw printf would land at an arbitrary console position,
+         * often off-screen) */
+        nh3ds_msg_add(args[0].s ? args[0].s : "");
         nh3ds_log("[raw_print] %s", args[0].s ? args[0].s : "");
         /* remember the first error for the hold-on-exit screen */
         if (!nh3ds_lastwords[0] && args[0].s)
@@ -1668,40 +1845,59 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
             nh3ds_log("[yn demo def='%c'] %s -> '%c'", def ? def : '?',
                       query, ans);
         } else {
-            /* real play: B = no/escape, Y = explicit yes, A (or any
-             * action button) = default / first allowed answer;
-             * directions are ignored */
+            /* real play: the query wraps in the detail pane, the touch
+             * keyboard answers with the exact choice letter, and the
+             * physical buttons shortcut the common cases (A = default,
+             * B = no/escape, Y = yes, X = quit-choice) */
+            nh3ds_keys_open = FALSE;
             nh3ds_scr(0);
             printf("\x1b[2J\x1b[0m");
-            printf("\x1b[1;1H\x1b[37;1m%-40.40s", query);
-            printf("\x1b[2;1H\x1b[0m%-40.40s",
-                   "[A]=default [B]=no/esc [Y]=yes");
+            nh3ds_detail(query);
+            nh3ds_kbd_render();
+            printf("\x1b[29;1H\x1b[36m%-40.40s",
+                   "A=default B=no/esc Y=yes tap=key");
             for (;;) {
-                int key = nh3ds_read_key();
-                char c = (char) key;
+                u32 down;
+                int tcol, trow;
 
-                if (c == 'i') { /* B: no / escape */
+                down = nh3ds_menu_input(&tcol, &trow);
+                if (tcol >= 0) {
+                    int ch = nh3ds_kbd_map(tcol, trow);
+                    char c;
+
+                    if (!ch)
+                        continue;
+                    c = (char) ch;
+                    if (resp && strchr(resp, c)) {
+                        ans = c;
+                        break;
+                    }
+                    c = nh3ds_lower(c); /* shifted tap -> choice letter */
+                    if (resp && strchr(resp, c)) {
+                        ans = c;
+                        break;
+                    }
+                } else if (down & (KEY_A | KEY_START)) {
+                    ans = (def && resp && strchr(resp, def))
+                              ? def
+                              : (resp && *resp) ? *resp : 'y';
+                    break;
+                } else if (down & KEY_B) {
                     ans = (resp && strchr(resp, 'n')) ? 'n' : '\033';
                     break;
-                }
-                /* Y ('s' in the game mapping): explicit yes, but only
-                 * when the prompt actually allows 'y' (e.g. "Really
-                 * save?" defaults to no and A alone can't accept it) */
-                if (c == 's' && resp && strchr(resp, 'y')) {
-                    ans = 'y';
-                    break;
-                }
-                if (c == '.' || c == 's' || c == ',' || c == 'S'
-                    || c == '?') {
-                    if (def && resp && strchr(resp, def))
-                        ans = def;
-                    else if (resp && *resp)
-                        ans = *resp;
-                    else
+                } else if (down & KEY_Y) {
+                    if (resp && strchr(resp, 'y')) {
                         ans = 'y';
-                    break;
+                        break;
+                    }
+                } else if (down & KEY_X) {
+                    if (resp && strchr(resp, 'q')) {
+                        ans = 'q';
+                        break;
+                    }
                 }
             }
+            nh3ds_full_redraw();
             rint = ans;
             nh3ds_log("[yn buttons def='%c'] %s -> '%c'", def ? def : '?',
                       query, ans);
