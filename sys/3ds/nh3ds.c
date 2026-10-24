@@ -44,6 +44,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 /* --- libnh API (sys/libnh/libnhmain.c; there is no header by design) --- */
@@ -191,6 +192,27 @@ static winid nh3ds_pop_win = -1;
 static char nh3ds_pop_lines[NH3DS_POPLINES][NH3DS_POPLINELEN];
 static int nh3ds_pop_n;
 static char nh3ds_pop_prompt[NH3DS_POPLINELEN];
+
+/* one buffered menu window; items are the add_menu() stream between
+ * start_menu and end_menu.  ch == 0 marks non-selectable text
+ * (headings, blank filler).  (Declared here, before the render/refresh
+ * code below needs nh3ds_menu.active.) */
+#define NH3DS_MAXMENU 128
+struct nh3ds_menuitem {
+    ANY_P id;
+    char ch, gch;
+    int attr, clr;
+    char str[96];
+    unsigned itemflags;
+};
+static struct nh3ds_menu {
+    winid win;
+    boolean active;
+    int n;
+    int top;                     /* first visible item row */
+    struct nh3ds_menuitem item[NH3DS_MAXMENU];
+    char prompt[128];
+} nh3ds_menu;
 
 /* status bar state, fed by status_update; field labels are ours (the
  * core's genl_status_enablefield stores fmts for its own use and never
@@ -455,7 +477,7 @@ static const char *const nh3ds_legend[TOP_ROWS - LEG_ROW0] = {
     "pad=hjkl two=diag L/R=run",
     "A=rest B=inv X=grab Y=search",
     "START=save SELECT=help",
-    "NetHack 3DS -- phase 2c",
+    "NetHack 3DS",
 };
 
 static void
@@ -587,8 +609,16 @@ nh3ds_wintypename(int type)
 static void
 nh3ds_refresh(void)
 {
-    if (nh3ds_msg_dirty)
+    if (nh3ds_msg_dirty) {
         nh3ds_draw_messages();
+        /* the bottom screen is the message-history tail; redraw it in
+         * step.  (No guard for popups/menus needed: those waits are
+         * synchronous inside our own handlers, so nh_poskey -- the only
+         * refresh() caller -- cannot fire while the bottom is owned;
+         * the perm_invent window keeps a MENU winid alive forever,
+         * which would block the tail forever if we tested pop_win.) */
+        nh3ds_draw_bot_msgs();
+    }
     if (nh3ds_map_dirty)
         nh3ds_draw_map();
     if (nh3ds_st_dirty)
@@ -717,25 +747,8 @@ nh3ds_read_key(void)
 /* menus (phase 2c)                                                       */
 /* ----------------------------------------------------------------------*/
 
-/* one buffered menu window; items are the add_menu() stream between
- * start_menu and end_menu.  ch == 0 marks non-selectable text
- * (headings, blank filler). */
-struct nh3ds_menuitem {
-    ANY_P id;
-    char ch, gch;
-    int attr, clr;
-    char str[96];
-    unsigned itemflags;
-};
-#define NH3DS_MAXMENU 128
-static struct nh3ds_menu {
-    winid win;
-    boolean active;
-    int n;
-    int top;                     /* first visible item row */
-    struct nh3ds_menuitem item[NH3DS_MAXMENU];
-    char prompt[128];
-} nh3ds_menu;
+/* (the menu state structs live near the top of the file, before the
+ * refresh code that checks nh3ds_menu.active) */
 
 static int
 nh3ds_menu_selectable(int i)
@@ -1145,6 +1158,7 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
             if (nh3ds_any_button_ever) {
                 nh3ds_menu_render(-1);
                 nh3ds_wait_button();
+                nh3ds_draw_bot_msgs();
             }
             nh3ds_menu.active = FALSE;
             rint = 0;
@@ -1156,6 +1170,7 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
         } else {
             rint = nh3ds_menu_pick(how, (MENU_ITEM_P **) args[2].p);
             nh3ds_menu.active = FALSE;
+            nh3ds_draw_bot_msgs(); /* the menu owned the bottom screen */
             nh3ds_log("[select_menu win=%d how=%d] -> %d", w, how, rint);
         }
     } else if (!strcmp(name, "shim_message_menu")) {
@@ -1235,18 +1250,27 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
             nh3ds_log("[yn demo def='%c'] %s -> '%c'", def ? def : '?',
                       query, ans);
         } else {
-            /* real play: B = no/escape, A (or any action button) =
-             * default / first allowed answer; directions are ignored */
+            /* real play: B = no/escape, Y = explicit yes, A (or any
+             * action button) = default / first allowed answer;
+             * directions are ignored */
             nh3ds_scr(0);
             printf("\x1b[2J\x1b[0m");
             printf("\x1b[1;1H\x1b[37;1m%-40.40s", query);
-            printf("\x1b[2;1H\x1b[0m%-40.40s", "[A]=default [B]=no/esc");
+            printf("\x1b[2;1H\x1b[0m%-40.40s",
+                   "[A]=default [B]=no/esc [Y]=yes");
             for (;;) {
                 int key = nh3ds_read_key();
                 char c = (char) key;
 
                 if (c == 'i') { /* B: no / escape */
                     ans = (resp && strchr(resp, 'n')) ? 'n' : '\033';
+                    break;
+                }
+                /* Y ('s' in the game mapping): explicit yes, but only
+                 * when the prompt actually allows 'y' (e.g. "Really
+                 * save?" defaults to no and A alone can't accept it) */
+                if (c == 's' && resp && strchr(resp, 'y')) {
+                    ans = 'y';
                     break;
                 }
                 if (c == '.' || c == 's' || c == ',' || c == 'S'
@@ -1450,13 +1474,18 @@ main(int argc, char *argv[])
     } else {
         nh3ds_trace = fopen("nh3ds.log", "w");
         if (nh3ds_trace)
-            nh3ds_log("[start] NetHack 3DS phase 2a, hackdir=%s",
+            nh3ds_log("[start] NetHack 3DS phase 2 (P2c+save), hackdir=%s",
                       nh3ds_hackdir);
         /* CHDIR is disabled in the SHIM_GRAPHICS configuration, so
          * check_recordfile() never runs; create the variable files. */
         nh3ds_ensure_file("record");
         nh3ds_ensure_file("logfile");
         nh3ds_ensure_file("xlogfile");
+        /* set_savefile_name() builds "save/<uid><plname>" relative to the
+         * playground directory; without the subdirectory create_savefile()
+         * fails and #save can never write ("Cannot open save file."), nor
+         * can the automatic restore on the next boot find anything. */
+        (void) mkdir("save", 0777); /* EEXIST is fine */
     }
 
     (void) atexit(nh3ds_cleanup);
