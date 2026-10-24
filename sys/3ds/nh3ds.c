@@ -70,6 +70,11 @@ static const char *nh3ds_plname = "Wizard";
 
 static FILE *nh3ds_trace;
 
+/* first raw_print/error we saw, shown on the hold-on-exit screen -- on
+ * real hardware the console is wiped the instant we return to the
+ * Homebrew Menu, so a fatal error would otherwise flash by unread */
+static char nh3ds_lastwords[192] = "";
+
 static void
 nh3ds_log(const char *fmt, ...)
 {
@@ -1215,6 +1220,10 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
         /* error()/panic() surface here -- always show and log */
         printf("%s\n", args[0].s ? args[0].s : "");
         nh3ds_log("[raw_print] %s", args[0].s ? args[0].s : "");
+        /* remember the first error for the hold-on-exit screen */
+        if (!nh3ds_lastwords[0] && args[0].s)
+            (void) snprintf(nh3ds_lastwords, sizeof nh3ds_lastwords,
+                            "%s", args[0].s);
     } else if (!strcmp(name, "shim_nhgetch")) {
         rint = nh3ds_read_key();
         ++nh3ds_getch_n;
@@ -1444,6 +1453,24 @@ static void
 nh3ds_cleanup(void)
 {
     nh3ds_dump_and_close();
+    /* hold-on-exit screen: keep the exit reason visible until the user
+     * acknowledges it (the console is wiped on return to the launcher) */
+    nh3ds_scr(1);
+    printf("\x1b[0m\x1b[26;1H\x1b[K");
+    if (nh3ds_lastwords[0])
+        printf("\x1b[27;1H\x1b[31m%.180s\x1b[0m", nh3ds_lastwords);
+    printf("\x1b[29;1H\x1b[36mexit -- press START to return to the "
+           "launcher\x1b[0m");
+    (void) fflush(stdout);
+    for (;;) {
+        u32 kdown;
+
+        hidScanInput();
+        kdown = hidKeysDown();
+        if (kdown & (KEY_START | KEY_SELECT | KEY_A | KEY_B))
+            break;
+        svcSleepThread(50 * 1000 * 1000LL); /* 50 ms */
+    }
     gfxExit();
 }
 
@@ -1471,6 +1498,9 @@ main(int argc, char *argv[])
 
     if (chdir(nh3ds_hackdir) < 0) {
         printf("nh3ds: cannot chdir to %s\n", nh3ds_hackdir);
+        (void) snprintf(nh3ds_lastwords, sizeof nh3ds_lastwords,
+                        "cannot chdir to %s -- is the nethack/ data folder "
+                        "(from the zip) on the SD card?", nh3ds_hackdir);
     } else {
         nh3ds_trace = fopen("nh3ds.log", "w");
         if (nh3ds_trace)
