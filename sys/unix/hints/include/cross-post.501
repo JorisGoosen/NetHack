@@ -208,8 +208,14 @@ $(TARGETPFX)NetHack3ds.elf: pregame $(TARGET_HACKLIB) \
 		$(HOBJ) $(TARGETPFX)date.o $(TARGET_HACKLIB) \
 		$(TARGET_LIBS)
 
-$(3DS_TARGET): $(TARGETPFX)NetHack3ds.elf
-	$(DEVKITPRO)/tools/bin/3dsxtool $< $@
+$(3DS_TARGET): $(TARGETPFX)NetHack3ds.elf $(TARGETPFX)nh3ds.smdh
+	$(DEVKITPRO)/tools/bin/3dsxtool $< $@ --smdh=$(TARGETPFX)nh3ds.smdh
+
+# the homebrew-menu icon (SMDH: titles + 48x48 png) is appended to the
+# .3dsx; hbmenu displays it on the launcher grid
+$(TARGETPFX)nh3ds.smdh: ../sys/3ds/icon.png
+	$(DEVKITPRO)/tools/bin/smdhtool --create "NetHack 3DS" \
+		"NetHack for the Nintendo 3DS" "nethack" $< $@
 
 $(3DS_DATA_DIR): $(3DS_DATA_DIR)/nhdat
 	touch $(3DS_DATA_DIR)/perm $(3DS_DATA_DIR)/record \
