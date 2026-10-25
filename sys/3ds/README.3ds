@@ -14,11 +14,17 @@ Play
 ----
 Launch the Homebrew Loader and start NetHack3ds.
 
-The current phase ships a stub front-end: the game boots, creates a
-character (random role) and sits in the main game loop resting one turn
-at a time.  Diagnostics are written to sdmc:/3ds/nethack/nh3ds.log and
-to the top screen.  Real map rendering and input arrive with the next
-phase; see sys/3ds/PLAN.md in the source distribution for the roadmap.
+The bottom screen is the control surface: the libctru console shows
+messages and menus, the D-pad walks (hjkl), L+pad runs, A/B/X/Y are
+rest/inventory/grab/search, START saves, SELECT opens help, and touch
+brings up the button keyboard for prompts and menus.
+
+The top screen renders the map in stereoscopic 3D: push the 3DS 3D
+slider up and the level becomes a diorama -- walls sit at the glass,
+monsters and objects a little behind, furniture (altars, up stairs)
+raised, floors deeper still, and down stairs deepest of all; a
+levitating or flying hero drifts up to its own plane.  Slider down
+gives the flat picture.  Diagnostics go to sdmc:/3ds/nethack/nh3ds.log.
 
 Building from source
 --------------------
