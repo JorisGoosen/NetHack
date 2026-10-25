@@ -1,0 +1,4 @@
+defaults.nh NHSUBST
+README.3ds NHSUBST
+icon.png -text
+* NH_filestag=(file%s_for_3DS_version)
