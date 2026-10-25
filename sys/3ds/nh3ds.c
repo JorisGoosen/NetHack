@@ -1,4 +1,4 @@
-/* NetHack 5.0 nh3ds.c    $NHDT-Date: 1792928538 2026/10/25 12:42:18 $  $NHDT-Branch: 3ds $:$NHDT-Revision: 1.18 $ */
+/* NetHack 5.0 nh3ds.c    $NHDT-Date: 1792928743 2026/10/25 12:45:43 $  $NHDT-Branch: 3ds $:$NHDT-Revision: 1.19 $ */
 /* Copyright (c) the NetHack 3DS port contributors, 2026.                */
 /* NetHack may be freely redistributed.  See license for details.        */
 
@@ -19,17 +19,16 @@
  * Phase 2b: hid input.  D-pad/circle-pad = hjkl (two held = diagonals,
  * L/R+direction = run), A='.' rest, B='i', X=',', Y='s', START='S',
  * SELECT='?'; yn prompts answer via buttons (B = no/esc, A = default).
- * Without any button press the stub keeps auto-playing forced rests so
- * unattended emulator runs still progress (demo mode).
+ * The 3drig rig file (see sys/3ds/README.3ds) switches the front-end
+ * to an unattended mode: canned name, auto-answered prompts,
+ * auto-cancelled menus, so emulator runs progress without a player.
  *
  * Phase 2a: console rendering.  The top screen (50x30 with the 8x8 font)
  * shows the message area (3 rows), the map viewport (21 rows x 50 cols,
  * horizontally scrolled via cliparound), a field-driven 2-row status bar
  * fed by status_update events, and a key legend.  The bottom screen (40x30)
  * shows the message-history tail, or the contents of a blocking menu/text
- * window while the game waits for a key.  Input is still the phase 1
- * canned answer (alternating 'm' prefix + '.' rest); real button input
- * arrives in phase 2b.
+ * window while the game waits for a key.
  *
  * Phase 4a: stereoscopic depth.  The top screen is now a citro2d stereo
  * viewport (the bottom screen keeps the console).  Map glyphs are drawn
@@ -44,7 +43,7 @@
  * hero glyph covered it (plus the terrain the core reports beneath the
  * hero via the background glyph) is drawn on its own layer just above
  * the floor.  A "3drig" file in the playground forces the slider to
- * 1.0, dumps both eyes as BMPs every 64 frames and puts demo mode on a
+ * 1.0, dumps both eyes as BMPs every 64 frames and runs the
  * wander-and-take-stairs autopilot.
  *
  * Build:  make CROSS_TO_3DS=1 all        (see sys/unix/hints/include/
@@ -79,7 +78,8 @@ extern void shim_graphics_set_callback(shim_callback_t cb);
  * SHIM_GRAPHICS configuration has no CHDIR (include/config.h) */
 static const char *nh3ds_hackdir = "sdmc:/3ds/nethack";
 
-/* canned answers for the phase 1 stub */
+/* canned name for unattended rig runs (a role name would pre-select
+ * that role in the core's name parsing) */
 static const char *nh3ds_plname = "Adventurer";
 
 /* ----------------------------------------------------------------------*/
@@ -2212,8 +2212,8 @@ nh3ds_menu_render(int cursor)
  * hid keys-down bits (0 for a tap, with the tapped cell in *tcol and
  * *trow).  L/R are excluded from the release wait: L is the shift
  * modifier for the touch keyboard and must stay holdable. */
-#define NH3DS_MENUWAIT_MASK                                                     \
-    (KEY_A | KEY_B | KEY_X | KEY_Y | KEY_START | KEY_SELECT                     \
+#define NH3DS_MENUWAIT_MASK \
+    (KEY_A | KEY_B | KEY_X | KEY_Y | KEY_START | KEY_SELECT \
      | KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT | KEY_TOUCH)
 static u32
 nh3ds_menu_input(int *tcol, int *trow)
@@ -3055,7 +3055,7 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
     } else if (!strcmp(name, "shim_getlin")) {
         const char *query = args[0].s ? args[0].s : "";
 
-        if (nh3ds_any_button_ever) {
+        if (!nh3ds_debug3d) {
             /* real play: software keyboard; ESC/cancel -> "\033" */
             if (nh3ds_swkbd(query, (char *) args[1].p, BUFSZ))
                 nh3ds_log("[getlin] %s -> \"%s\"", query,
@@ -3066,10 +3066,10 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
             }
         } else {
             strcpy((char *) args[1].p, "\033");
-            nh3ds_log("[getlin demo] %s -> ESC", query);
+            nh3ds_log("[getlin rig] %s -> ESC", query);
         }
     } else if (!strcmp(name, "shim_get_ext_cmd")) {
-        if (nh3ds_any_button_ever) {
+        if (!nh3ds_debug3d) {
             /* our own ext-command menu: top-screen list, live prefix
              * filtering from the touch letter keyboard (the core's
              * extcmd_via_menu() is TTY/CURSES-only) */
@@ -3077,7 +3077,7 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
             nh3ds_full_redraw();
             nh3ds_log("[get_ext_cmd] -> %d", rint);
         } else {
-            rint = -1; /* demo mode: cancelled */
+            rint = -1; /* rig: cancelled */
         }
     } else if (!strcmp(name, "shim_number_pad")) {
         /* nothing */
@@ -3115,7 +3115,7 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
                 /* tty-oriented fields carry padding and glyph encodings:
                  * title/ldesc are blank-padded, gold is \GXXXXXXXX:NNN */
                 nh3ds_trim(nh3ds_st_val[fldidx]);
-                if (nh3ds_st_val[fldidx][0] == '\\' 
+                if (nh3ds_st_val[fldidx][0] == '\\'
                     && nh3ds_st_val[fldidx][1] == 'G'
                     && strlen(nh3ds_st_val[fldidx]) >= 11
                     && nh3ds_st_val[fldidx][10] == ':') {
