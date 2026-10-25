@@ -1,4 +1,4 @@
-/* NetHack 5.0 nh3ds.c    $NHDT-Date: $  $NHDT-Branch: 3ds $:$NHDT-Revision: $ */
+/* NetHack 5.0 nh3ds.c    $NHDT-Date: 1792927523 2026/10/25 12:25:23 $  $NHDT-Branch: 3ds $:$NHDT-Revision: 1.14 $ */
 /* Copyright (c) the NetHack 3DS port contributors, 2026.                */
 /* NetHack may be freely redistributed.  See license for details.        */
 
@@ -166,8 +166,6 @@ nh3ds_dump_and_close(void)
 /* ----------------------------------------------------------------------*/
 /* screen geometry and render state                                       */
 /* ----------------------------------------------------------------------*/
-
-static winid nh3ds_nextwin = 1;   /* synthetic winid counter */
 
 /* top console is 50x30 with the 8x8 font; bottom is 40x30 */
 #define TOP_COLS 50
@@ -2540,17 +2538,31 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
         /* nothing */
     } else if (!strcmp(name, "shim_create_nhwindow")) {
         int type = args[0].i;
+        winid w;
 
-        rint = (int) nh3ds_nextwin++;
-        if (rint > 0 && rint < NH3DS_MAXWINID)
-            nh3ds_wintype[rint] = (unsigned char) (type + 1);
-        if (type == NHW_MENU || type == NHW_TEXT) {
-            nh3ds_pop_win = (winid) rint;
-            nh3ds_pop_n = 0;
-            nh3ds_pop_prompt[0] = '\0';
+        /* take the lowest free id: destroyed popups hand their slot
+         * back for reuse, mirroring tty_create_nhwindow -- the core
+         * churns through popup menus, and a monotonic counter would
+         * exhaust the table mid-session and silently kill every
+         * menu from then on */
+        for (w = 1; w < NH3DS_MAXWINID; ++w)
+            if (!nh3ds_wintype[w])
+                break;
+        if (w == NH3DS_MAXWINID) {
+            panic("No window slots!");
+            /*NOTREACHED*/
+            rint = 0;
+        } else {
+            rint = (int) w;
+            nh3ds_wintype[w] = (unsigned char) (type + 1);
+            if (type == NHW_MENU || type == NHW_TEXT) {
+                nh3ds_pop_win = w;
+                nh3ds_pop_n = 0;
+                nh3ds_pop_prompt[0] = '\0';
+            }
+            nh3ds_log("[create_nhwindow] type=%s -> winid=%d",
+                      nh3ds_wintypename(type), (int) w);
         }
-        nh3ds_log("[create_nhwindow] type=%s -> winid=%d",
-                  nh3ds_wintypename(type), rint);
     } else if (!strcmp(name, "shim_clear_nhwindow")) {
         winid w = (winid) args[0].i;
         int ty = (w > 0 && w < NH3DS_MAXWINID) ? nh3ds_wintype[w] - 1 : -1;
