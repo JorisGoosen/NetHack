@@ -1,4 +1,4 @@
-/* NetHack 5.0 nh3ds.c    $NHDT-Date: 1792928743 2026/10/25 12:45:43 $  $NHDT-Branch: 3ds $:$NHDT-Revision: 1.19 $ */
+/* NetHack 5.0 nh3ds.c    $NHDT-Date: 1792931241 2026/10/25 13:27:21 $  $NHDT-Branch: 3ds $:$NHDT-Revision: 1.20 $ */
 /* Copyright (c) the NetHack 3DS port contributors, 2026.                */
 /* NetHack may be freely redistributed.  See license for details.        */
 
@@ -92,6 +92,9 @@ static FILE *nh3ds_trace;
  * real hardware the console is wiped the instant we return to the
  * Homebrew Menu, so a fatal error would otherwise flash by unread */
 static char nh3ds_lastwords[192] = "";
+/* hand-set reasons (chdir hint, atlas failure) are sticky: the
+ * raw_print feed must not replace them with a less specific message */
+static boolean nh3ds_lastwords_sticky;
 
 static void
 nh3ds_log(const char *fmt, ...)
@@ -2916,8 +2919,11 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
          * often off-screen) */
         nh3ds_msg_add(args[0].s ? args[0].s : "");
         nh3ds_log("[raw_print] %s", args[0].s ? args[0].s : "");
-        /* remember the first error for the hold-on-exit screen */
-        if (!nh3ds_lastwords[0] && args[0].s)
+        /* remember the last error for the hold-on-exit screen:
+         * last-wins because panic() prints an "Oops..." prologue first
+         * and the actual reason last (end.c); sticky hand-set reasons
+         * are never replaced */
+        if (!nh3ds_lastwords_sticky && args[0].s)
             (void) snprintf(nh3ds_lastwords, sizeof nh3ds_lastwords,
                             "%s", args[0].s);
     } else if (!strcmp(name, "shim_nhgetch")) {
@@ -3223,6 +3229,7 @@ main(int argc, char *argv[])
         (void) snprintf(nh3ds_lastwords, sizeof nh3ds_lastwords,
                         "cannot chdir to %s -- is the nethack/ data folder "
                         "(from the zip) on the SD card?", nh3ds_hackdir);
+        nh3ds_lastwords_sticky = TRUE;
     } else {
         FILE *f;
         /* debug aid: force the 3D slider, dump both eyes as BMPs into

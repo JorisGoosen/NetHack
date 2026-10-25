@@ -1,4 +1,4 @@
-/* NetHack 5.0 nh3dslib.c    $NHDT-Date: $  $NHDT-Branch: 3ds $:$NHDT-Revision: $ */
+/* NetHack 5.0 nh3dslib.c    $NHDT-Date: 1792931241 2026/10/25 13:27:21 $  $NHDT-Branch: 3ds $:$NHDT-Revision: 1.1 $ */
 /* Copyright (c) the NetHack 3DS port contributors, 2026.                */
 /* NetHack may be freely redistributed.  See license for details.        */
 
@@ -162,7 +162,10 @@ error(const char *s, ...)
     va_end(the_args);
     if (iflags.window_inited)
         exit_nhwindows((char *) 0);
-    printf("%s\n", buf);
+    /* via the windowport, so the reason reaches the port's message
+     * ring and the hold-on-exit screen; a bare printf would be wiped
+     * the instant control returns to the Homebrew Menu */
+    raw_print(buf);
     exit(EXIT_FAILURE);
 }
 
