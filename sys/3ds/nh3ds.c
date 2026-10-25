@@ -1,4 +1,4 @@
-/* NetHack 5.0 nh3ds.c    $NHDT-Date: 1792931241 2026/10/25 13:27:21 $  $NHDT-Branch: 3ds $:$NHDT-Revision: 1.20 $ */
+/* NetHack 5.0 nh3ds.c    $NHDT-Date: 1792931281 2026/10/25 13:28:01 $  $NHDT-Branch: 3ds $:$NHDT-Revision: 1.21 $ */
 /* Copyright (c) the NetHack 3DS port contributors, 2026.                */
 /* NetHack may be freely redistributed.  See license for details.        */
 
@@ -397,7 +397,7 @@ nh3ds_scr(int top) /* select the console for printf(); only the bottom
 /* expand the libctru console font into a white-on-transparent RGBA
  * atlas and swizzle it into the PICA's 8x8-morton-tile texture layout
  * (reference: citra's texture_codec.h) */
-static void
+static boolean
 nh3ds_atlas_init(void)
 {
     /* within an 8x8 tile, row y starts at morton_row[y] texels and
@@ -439,7 +439,7 @@ nh3ds_atlas_init(void)
     }
     if (!C3D_TexInit(&nh3ds_glyph_tex, NH3DS_ATLAS_W, NH3DS_ATLAS_H,
                      GPU_RGBA8))
-        return;
+        return FALSE;
     C3D_TexUpload(&nh3ds_glyph_tex, tiled);
     C3D_TexSetFilter(&nh3ds_glyph_tex, GPU_NEAREST, GPU_NEAREST);
     C3D_TexSetWrap(&nh3ds_glyph_tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
@@ -455,6 +455,7 @@ nh3ds_atlas_init(void)
         nh3ds_glyph_sub[ch].bottom =
             1.0f - (float) (ay + 8) / NH3DS_ATLAS_H;
     }
+    return TRUE;
 }
 
 /* the NetHack classic palette; index by the stored color value
@@ -1127,7 +1128,16 @@ nh3ds_gpu_init(void)
         C2D_PlainImageTint(&nh3ds_tints_dim[i], nh3ds_dim_rgb(nh3ds_rgb[i]),
                            1.0f);
     }
-    nh3ds_atlas_init();
+    if (!nh3ds_atlas_init()) {
+        /* leave nh3ds_gpu_ok FALSE: frame drawing and the GPU teardown
+         * are skipped; sampling an uninitialized texture would be
+         * worse than a dark top screen */
+        (void) snprintf(nh3ds_lastwords, sizeof nh3ds_lastwords,
+                        "glyph atlas init failed -- top screen off");
+        nh3ds_lastwords_sticky = TRUE;
+        nh3ds_log("[gpu] atlas init failed");
+        return;
+    }
     gfxSet3D(FALSE);
     nh3ds_stereo = FALSE;
     nh3ds_gpu_ok = TRUE;
