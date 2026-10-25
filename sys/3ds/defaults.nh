@@ -9,5 +9,6 @@
 # The interface is the built-in "shim" windowport driven by the 3DS
 # front-end; windowtype is baked in and cannot be changed here.
 
-# keep a permanent inventory list available for the inventory screen
+# accepted by the core, but the 3DS front-end does not render a
+# permanent inventory window yet -- inventory opens as a menu either way
 OPTIONS=perm_invent

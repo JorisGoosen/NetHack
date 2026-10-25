@@ -24,7 +24,9 @@ slider up and the level becomes a diorama -- walls sit at the glass,
 monsters and objects a little behind, furniture (altars, up stairs)
 raised, floors deeper still, and down stairs deepest of all; a
 levitating or flying hero drifts up to its own plane.  Slider down
-gives the flat picture.  Diagnostics go to sdmc:/3ds/nethack/nh3ds.log.
+gives the flat picture.  Diagnostics: fatal errors hold on screen until a button is pressed;
+with a 3drig rig file present (see PLAN.md) a trace log is also
+written to sdmc:/3ds/nethack/nh3ds.log.
 
 Building from source
 --------------------

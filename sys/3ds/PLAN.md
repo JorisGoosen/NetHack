@@ -293,7 +293,7 @@ sys/3ds/ components
     - status: P2 MVP is implemented (see Implementation status below):
       full console rendering (top 50x30 map/messages/status, bottom 40x30
       tail/popups), hid input mapping, buffered menus, swkbd text entry,
-      save/restore glue, and a canned demo/attract mode for unattended
+      save/restore glue, and an unattended rig mode (3drig file) for
       emulator testing. The original P1 stub is in git history.
     - callback form: the non-emscripten shim takes a direct C function
       pointer, `void (*)(const char *name, void *ret_ptr, const char *fmt,
@@ -387,7 +387,8 @@ P2  DONE 2026-10-24 (commits 5294dab31, 69ca9b585, 4fabae251, 62c283943):
     save/restore, death -> tombstone -> topten -> clean exit -- all
     verified in Azahar (see Implementation status below). The "full
     ascension-attemptable session" is met mechanically; a long real-input
-    play session is the remaining bit (demo mode plays itself meanwhile).
+    play session is the remaining bit (the 3drig rig autopilot plays
+    itself meanwhile).
 
 P3  UX polish: bottom-screen menus w/ touch, message history browsing, key
     remapping, options via defaults.nh, status hilites/colors, ~50-col
@@ -411,7 +412,8 @@ P5  (optional) .cia packaging (makerom+bannertool), upstream pull request to
 
 Implementation status (2026-10-24, overnight session)
 -----------------------------------------------------
-Branch `3ds`, six commits, nothing pushed:
+Branch `3ds`, six commits at the time of writing (since pushed and
+continued -- see `git log` for the current list):
 
     8d72aad2a  build integration + P1 stub front-end
     823d24fd4  Azahar boot fixes (select_menu -1, canned rests, fcntl)
@@ -567,7 +569,7 @@ Build:
     # stub main.
 
 Run (hardware):
-    unzip pkg to 3ds:/3ds/nethack on the SD card (or 3dslink NetHack3ds.3dsx
+    unzip pkg to sdmc:/3ds/nethack on the SD card (or 3dslink NetHack3ds.3dsx
     with the pkg contents in place), launch from the Homebrew Launcher.
     (Emulator testing: see Azahar above.)
 
