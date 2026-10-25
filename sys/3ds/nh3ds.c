@@ -1638,7 +1638,8 @@ nh3ds_next_key(void) /* 0 = nothing to report this frame */
         if (btns & KEY_A)
             key = '.', repeatable = TRUE;
         else if (btns & KEY_B)
-            key = 'i';
+            /* in getpos (farlook/travel cursor mode) B is the escape */
+            key = (program_state.input_state == getposInp) ? '\033' : 'i';
         else if (btns & KEY_X)
             key = ',';
         else if (btns & KEY_Y)
@@ -2832,7 +2833,7 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
             nh3ds_detail(query);
             nh3ds_kbd_render();
             printf("\x1b[29;1H\x1b[36m%-40.40s",
-                   "A=default B=no/esc Y=yes tap=key");
+                   "A=yes B=no START=def tap=key");
             for (;;) {
                 u32 down;
                 int tcol, trow;
@@ -2845,7 +2846,10 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
                     if (!ch)
                         continue;
                     c = (char) ch;
-                    if (resp && strchr(resp, c)) {
+                    /* resp == NULL is the getdir() direction prompt:
+                     * any tapped char is offered to the core, which
+                     * validates it (help_dir on a bad one) */
+                    if (!resp || strchr(resp, c)) {
                         ans = c;
                         break;
                     }
@@ -2854,10 +2858,36 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
                         ans = c;
                         break;
                     }
-                } else if (down & (KEY_A | KEY_START)) {
+                } else if (down & (KEY_DUP | KEY_DDOWN | KEY_DLEFT
+                                   | KEY_DRIGHT)) {
+                    /* direction prompt: the d-pad answers directly with
+                     * the direction char (same map as the main input) */
+                    ans = (char) ((down & KEY_DUP)
+                                      ? ((down & KEY_DLEFT)
+                                             ? 'y'
+                                             : (down & KEY_DRIGHT) ? 'u'
+                                                                   : 'k')
+                                      : (down & KEY_DLEFT)
+                                          ? ((down & KEY_DRIGHT) ? 'b' : 'h')
+                                          : (down & KEY_DRIGHT) ? 'n' : 'j');
+                    break;
+                } else if (down & KEY_A) {
+                    /* yes/no prompts: A = yes (console convention);
+                     * otherwise the default or first choice */
+                    if (resp && strchr(resp, 'y'))
+                        ans = 'y';
+                    else
+                        ans = (def && resp && strchr(resp, def))
+                                  ? def
+                                  : (resp && *resp) ? *resp
+                                      : (resp ? 'y' : '.');
+                    break;
+                } else if (down & KEY_START) {
+                    /* START keeps the default-answer shortcut */
                     ans = (def && resp && strchr(resp, def))
                               ? def
-                              : (resp && *resp) ? *resp : 'y';
+                              : (resp && *resp) ? *resp
+                                  : (resp ? 'y' : '.');
                     break;
                 } else if (down & KEY_B) {
                     ans = (resp && strchr(resp, 'n')) ? 'n' : '\033';
