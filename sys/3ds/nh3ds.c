@@ -2060,7 +2060,29 @@ nh3ds_read_key(void)
 static int
 nh3ds_menu_selectable(int i)
 {
-    return nh3ds_menu.item[i].ch != '\0';
+    /* tty's rule: selectable iff the core gave the item an identifier
+     * (headers/headings arrive with a zero id) */
+    return nh3ds_menu.item[i].id.a_void != 0;
+}
+
+/* tty assigns keyboard accelerators itself to items that arrived
+ * without one (the pickup menu passes ch = 0 for floor objects);
+ * mirror its pool: 'a'..'z' then 'A'.. */
+static void
+nh3ds_menu_assign_accels(void)
+{
+    char menu_ch = 'a';
+    int i;
+
+    for (i = 0; i < nh3ds_menu.n; ++i) {
+        struct nh3ds_menuitem *m = &nh3ds_menu.item[i];
+
+        if (m->id.a_void && !m->ch) {
+            m->ch = menu_ch;
+            if (menu_ch++ == 'z')
+                menu_ch = 'A';
+        }
+    }
 }
 
 /* render the buffered menu on the TOP screen (the map is paused while
@@ -2138,6 +2160,7 @@ nh3ds_menu_pick(int how, MENU_ITEM_P **menulist)
     int cursor = -1, i, n;
     MENU_ITEM_P *out;
 
+    nh3ds_menu_assign_accels();
     for (i = 0; i < nh3ds_menu.n; ++i)
         if (nh3ds_menu_selectable(i)) {
             cursor = i;
