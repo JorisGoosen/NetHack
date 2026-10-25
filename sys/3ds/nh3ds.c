@@ -1,4 +1,4 @@
-/* NetHack 5.0 nh3ds.c    $NHDT-Date: 1792931281 2026/10/25 13:28:01 $  $NHDT-Branch: 3ds $:$NHDT-Revision: 1.21 $ */
+/* NetHack 5.0 nh3ds.c    $NHDT-Date: 1792931311 2026/10/25 13:28:31 $  $NHDT-Branch: 3ds $:$NHDT-Revision: 1.22 $ */
 /* Copyright (c) the NetHack 3DS port contributors, 2026.                */
 /* NetHack may be freely redistributed.  See license for details.        */
 
@@ -2258,7 +2258,8 @@ nh3ds_menu_input(int *tcol, int *trow)
 }
 
 /* interactive menu selection; returns the number of picks (or -1) and
- * fills *menulist with a malloc'd menu_item array */
+ * fills *menulist with a menu_item array (core allocator; the core
+ * frees it) */
 static int
 nh3ds_menu_pick(int how, MENU_ITEM_P **menulist)
 {
@@ -2385,9 +2386,9 @@ nh3ds_menu_pick(int how, MENU_ITEM_P **menulist)
             ++n;
     if (n == 0)
         return 0;
-    out = (MENU_ITEM_P *) malloc((size_t) n * sizeof *out);
-    if (!out)
-        return -1;
+    /* the core allocator panics on exhaustion instead of failing
+     * silently; the core frees the list (doc/window.txt) */
+    out = (MENU_ITEM_P *) alloc((unsigned) n * sizeof *out);
     n = 0;
     for (i = 0; i < nh3ds_menu.n; ++i)
         if (nh3ds_menu.item[i].itemflags & MENU_ITEMFLAGS_SELECTED) {
