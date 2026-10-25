@@ -1,4 +1,4 @@
-/* NetHack 5.0 nh3ds.c    $NHDT-Date: 1792931311 2026/10/25 13:28:31 $  $NHDT-Branch: 3ds $:$NHDT-Revision: 1.22 $ */
+/* NetHack 5.0 nh3ds.c    $NHDT-Date: 1792931363 2026/10/25 13:29:23 $  $NHDT-Branch: 3ds $:$NHDT-Revision: 1.23 $ */
 /* Copyright (c) the NetHack 3DS port contributors, 2026.                */
 /* NetHack may be freely redistributed.  See license for details.        */
 
@@ -1212,6 +1212,19 @@ static boolean nh3ds_keys_open;
  * during name entry and role setup first) */
 static boolean nh3ds_any_button_ever;
 
+/* aptMainLoop() turns FALSE when the system wants the process gone
+ * (another applet taking over now; HOME handling for a future .cia).
+ * The indefinite wait loops call this and leave through exit() so the
+ * atexit cleanup runs. */
+static void
+nh3ds_apt_check(void)
+{
+    if (!aptMainLoop()) {
+        nh3ds_log("[apt] system requested exit");
+        exit(EXIT_SUCCESS); /* atexit: nh3ds_cleanup */
+    }
+}
+
 /* wait for any button press (edge-triggered: must be released first);
  * returns the button bits, or 0 if it auto-continued because no
  * interaction has happened yet */
@@ -1227,6 +1240,7 @@ nh3ds_wait_button(void)
         held = hidKeysHeld();
     } while (held != 0);
     for (;;) {
+        nh3ds_apt_check();
         hidScanInput();
         gspWaitForVBlank();
         held = hidKeysHeld();
@@ -2135,6 +2149,7 @@ nh3ds_read_key(void)
     int key;
 
     for (;;) {
+        nh3ds_apt_check();
         key = nh3ds_next_key();
         if (key)
             return key;
@@ -2242,6 +2257,7 @@ nh3ds_menu_input(int *tcol, int *trow)
         for (;;) {
             int tc, tr;
 
+            nh3ds_apt_check();
             if (nh3ds_tap(&tc, &tr)) {
                 *tcol = tc;
                 *trow = tr;
@@ -3207,6 +3223,9 @@ nh3ds_cleanup(void)
     for (;;) {
         u32 kdown;
 
+        if (!aptMainLoop())
+            break; /* the system wants us gone: skip the wait (exit()
+                    * here would re-enter atexit, which is undefined) */
         hidScanInput();
         kdown = hidKeysDown();
         if (kdown & (KEY_START | KEY_SELECT | KEY_A | KEY_B))
