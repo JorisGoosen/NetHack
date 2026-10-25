@@ -242,7 +242,7 @@ static const unsigned char nh3ds_depth[NH3DS_D_LAYERS] = {
     6,  /* furniture / stairs up */
     8,  /* under the hero */
     10, /* floor */
-    13  /* stairs down / pits: below the floor plane */
+    18  /* stairs down / pits: a hole in the floor plane */
 };
 
 /* what the top screen currently paints */
@@ -636,10 +636,13 @@ nh3ds_draw_map_eye(float eye, float slider)
                 if (lay == layer)
                     nh3ds_glyph(cell->c, cell->color, px, py, FALSE);
                 /* terrain behind whatever stands on it -- not behind
-                 * walls (they have no floor footprint) and not under
-                 * the floor's own glyphs (that would double-draw) */
+                 * walls (they have no floor footprint), not under
+                 * the floor's own glyphs (that would double-draw) and
+                 * not behind down-openings (stairs/pits are holes in
+                 * the floor; the floor plane would cover them) */
                 if (layer == NH3DS_D_FLOOR && lay != NH3DS_D_WALL
-                    && lay != NH3DS_D_FLOOR && bg->c && bg->c != ' ')
+                    && lay != NH3DS_D_FLOOR && lay != NH3DS_D_DOWN
+                    && bg->c && bg->c != ' ')
                     /* the tty shows the primary (above) glyph on this
                      * cell, so the terrain behind it is "under
                      * something" -- keep it well out of its way */
@@ -2881,10 +2884,15 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
                         ans = c;
                         break;
                     }
-                } else if (down & (KEY_DUP | KEY_DDOWN | KEY_DLEFT
-                                   | KEY_DRIGHT)) {
-                    /* direction prompt: the d-pad answers directly with
-                     * the direction char (same map as the main input) */
+                } else if (!resp
+                           && (down & (KEY_DUP | KEY_DDOWN | KEY_DLEFT
+                                       | KEY_DRIGHT))) {
+                    /* direction prompt (no response set): the d-pad
+                     * answers directly with the direction char (same
+                     * map as the main input).  Gated on !resp: on a
+                     * yes/no or lettered prompt a direction char is an
+                     * invalid answer and the core flags "program in
+                     * disorder". */
                     ans = (char) ((down & KEY_DUP)
                                       ? ((down & KEY_DLEFT)
                                              ? 'y'
@@ -2893,6 +2901,16 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
                                       : (down & KEY_DLEFT)
                                           ? ((down & KEY_DRIGHT) ? 'b' : 'h')
                                           : (down & KEY_DRIGHT) ? 'n' : 'j');
+                    break;
+                } else if (!resp && !strncmp(query, "Shall I pick", 12)
+                           && (down & (KEY_A | KEY_START | KEY_Y | KEY_B))) {
+                    /* the generic role-setup prompt ("Shall I pick a
+                     * role, race, ...? [ynaq]") arrives with resp NULL
+                     * like a direction prompt; here B must answer "no"
+                     * (pick via menus) because esc quits role selection
+                     * outright and the game would start with a random
+                     * role.  A/START/Y = yes (random pick + confirm). */
+                    ans = (down & KEY_B) ? 'n' : 'y';
                     break;
                 } else if (down & KEY_A) {
                     /* yes/no prompts: A = yes (console convention);
