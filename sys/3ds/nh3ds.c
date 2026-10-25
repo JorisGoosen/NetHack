@@ -1,4 +1,4 @@
-/* NetHack 5.0 nh3ds.c    $NHDT-Date: 1792927523 2026/10/25 12:25:23 $  $NHDT-Branch: 3ds $:$NHDT-Revision: 1.14 $ */
+/* NetHack 5.0 nh3ds.c    $NHDT-Date: 1792927630 2026/10/25 12:27:10 $  $NHDT-Branch: 3ds $:$NHDT-Revision: 1.15 $ */
 /* Copyright (c) the NetHack 3DS port contributors, 2026.                */
 /* NetHack may be freely redistributed.  See license for details.        */
 
@@ -814,9 +814,10 @@ nh3ds_st_row(int row, const int *flds, int nflds, boolean use_cond)
         if (!nh3ds_st_val[fld][0])
             continue; /* field disabled or not (yet) reported */
         if (nh3ds_st_fmt[fld][0])
-            (void) sprintf(seg, nh3ds_st_fmt[fld], nh3ds_st_val[fld]);
+            (void) snprintf(seg, sizeof seg, nh3ds_st_fmt[fld],
+                            nh3ds_st_val[fld]);
         else
-            (void) sprintf(seg, "%s", nh3ds_st_val[fld]);
+            (void) snprintf(seg, sizeof seg, "%s", nh3ds_st_val[fld]);
         if (!*seg || !strcmp(seg, " "))
             continue;
         if (col + (int) strlen(seg) > TOP_COLS)
@@ -833,7 +834,7 @@ nh3ds_st_row(int row, const int *flds, int nflds, boolean use_cond)
 
             if ((nh3ds_st_cond & nh3ds_cond[k].mask) == 0L)
                 continue;
-            (void) sprintf(seg, " %s", nh3ds_cond[k].tag);
+            (void) snprintf(seg, sizeof seg, " %s", nh3ds_cond[k].tag);
             if (col + (int) strlen(seg) > TOP_COLS)
                 break;
             nh3ds_text(col, ST_ROW0 + row, seg, 11 /* yellow */);
@@ -922,9 +923,10 @@ nh3ds_draw_menu(void)
                 tag = "* ";
         }
         if (m->ch && m->ch != ' ')
-            (void) sprintf(line, "%s%c) %s", tag, m->ch, m->str);
+            (void) snprintf(line, sizeof line, "%s%c) %s", tag, m->ch,
+                            m->str);
         else
-            (void) sprintf(line, "%s%s", tag, m->str);
+            (void) snprintf(line, sizeof line, "%s%s", tag, m->str);
         nh3ds_text(0, row + 1, line, nh3ds_menu_selectable(i) ? -1 : 14);
     }
     nh3ds_text(0, TOP_ROWS - 2, "pad=move A=ok B=cancel letter=select", 6);
@@ -937,15 +939,15 @@ nh3ds_draw_ext(void)
     char line[64];
     int i;
 
-    (void) sprintf(line, "#%.22s_", nh3ds_ext.filter);
+    (void) snprintf(line, sizeof line, "#%.22s_", nh3ds_ext.filter);
     nh3ds_text(0, 0, line, 15);
     for (i = nh3ds_ext.mtop; i < nh3ds_ext.nm && i < nh3ds_ext.mtop + 26;
          ++i) {
         const struct ext_func_tab *ef = &extcmdlist[nh3ds_ext.match[i]];
 
-        (void) sprintf(line, "%s%-14.14s %.32s",
-                       (i == nh3ds_ext.cursor) ? "> " : "  ", ef->ef_txt,
-                       ef->ef_desc ? ef->ef_desc : "");
+        (void) snprintf(line, sizeof line, "%s%-14.14s %.32s",
+                        (i == nh3ds_ext.cursor) ? "> " : "  ", ef->ef_txt,
+                        ef->ef_desc ? ef->ef_desc : "");
         nh3ds_text(0, i - nh3ds_ext.mtop + 1, line, -1);
     }
     if (!nh3ds_ext.nm)
@@ -1011,8 +1013,8 @@ nh3ds_debug_dump(void)
 
         if (!fb)
             continue;
-        (void) sprintf(fn, "dump3d_%02lu_%s.bmp",
-                       (unsigned long) (nh3ds_frame_n / 64) % 32, eye[i]);
+        (void) snprintf(fn, sizeof fn, "dump3d_%02lu_%s.bmp",
+                        (unsigned long) (nh3ds_frame_n / 64) % 32, eye[i]);
         (void) memset(hdr, 0, sizeof hdr);
         hdr[0] = 'B', hdr[1] = 'M';
         hdr[2] = (u8) sz, hdr[3] = (u8) (sz >> 8);
