@@ -1565,8 +1565,6 @@ nh3ds_overlay_map(int cx, int cy)
 /* hid input (phase 2b)                                                   */
 /* ----------------------------------------------------------------------*/
 
-static boolean nh3ds_demo_toggle; /* canned m/. alternation in demo mode */
-
 /* Button mapping (sys/3ds/PLAN.md "UI design"):
  *   d-pad / circle pad  hjkl (two held = diagonals yubn)
  *   L+dir = run (HJKL/YUBN); L alone = shift for the touch keyboard
@@ -2034,18 +2032,11 @@ nh3ds_read_key(void)
                       (unsigned) key, svm.moves);
             return key;
         }
-        /* demo mode: nobody has ever touched the controls, keep the
-         * game moving with the forced no-op rest ('m' prefix + '.');
-         * once any button is seen, real input takes over for good */
-        if (!nh3ds_any_button_ever) {
-            int k;
-
-            if (nh3ds_debug3d) {
-                k = nh3ds_demo_walk(); /* wander + take stairs */
-            } else {
-                nh3ds_demo_toggle = !nh3ds_demo_toggle;
-                k = nh3ds_demo_toggle ? '.' : 'm';
-            }
+        /* the debug rig's autopilot keeps unattended rig runs moving;
+         * without the rig file the game simply waits for a real
+         * player -- no autopilot, ever */
+        if (!nh3ds_any_button_ever && nh3ds_debug3d) {
+            int k = nh3ds_demo_walk();
             {
                 static unsigned long dk_n;
 
