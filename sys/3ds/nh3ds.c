@@ -1,4 +1,4 @@
-/* NetHack 5.0 nh3ds.c    $NHDT-Date: 1792928036 2026/10/25 12:33:56 $  $NHDT-Branch: 3ds $:$NHDT-Revision: 1.16 $ */
+/* NetHack 5.0 nh3ds.c    $NHDT-Date: 1792928357 2026/10/25 12:39:17 $  $NHDT-Branch: 3ds $:$NHDT-Revision: 1.17 $ */
 /* Copyright (c) the NetHack 3DS port contributors, 2026.                */
 /* NetHack may be freely redistributed.  See license for details.        */
 
@@ -2123,14 +2123,8 @@ nh3ds_read_key(void)
 
     for (;;) {
         key = nh3ds_next_key();
-        if (key) {
-            /* TEMP trace: pin down the kick direction-prompt input
-             * loss; every real key the game receives, one log line */
-            nh3ds_log("[key] '%c' (0x%02x) moves=%ld",
-                      (key >= 32 && key < 127) ? key : '?',
-                      (unsigned) key, svm.moves);
+        if (key)
             return key;
-        }
         /* the debug rig's autopilot keeps unattended rig runs moving;
          * without the rig file the game simply waits for a real
          * player -- no autopilot, ever */
@@ -2736,6 +2730,10 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
                     NH3DS_POPLINELEN - 1);
             nh3ds_pop_lines[nh3ds_pop_n][NH3DS_POPLINELEN - 1] = '\0';
             ++nh3ds_pop_n;
+        } else if ((ty == NHW_MENU || ty == NHW_TEXT)
+                   && w == nh3ds_pop_win) {
+            nh3ds_log("[putstr] popup full (%d lines), dropping \"%s\"",
+                      NH3DS_POPLINES, str);
         }
     } else if (!strcmp(name, "shim_display_file")) {
         nh3ds_display_file(args[0].s ? args[0].s : "", args[1].i != 0);
@@ -2758,19 +2756,26 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
         char ch = (char) args[3].i;
         const char *str = args[7].s ? args[7].s : "";
 
-        if (nh3ds_menu.active && w == nh3ds_menu.win
-            && nh3ds_menu.n < NH3DS_MAXMENU) {
-            struct nh3ds_menuitem *m = &nh3ds_menu.item[nh3ds_menu.n];
+        if (nh3ds_menu.active && w == nh3ds_menu.win) {
+            if (nh3ds_menu.n >= NH3DS_MAXMENU) {
+                nh3ds_log("[add_menu] full (%d), dropping \"%s\"",
+                          NH3DS_MAXMENU, str);
+            } else {
+                struct nh3ds_menuitem *m = &nh3ds_menu.item[nh3ds_menu.n];
 
-            m->id = *(const ANY_P *) (const void *) (uintptr_t) args[2].i;
-            m->ch = ch;
-            m->gch = (char) args[4].i;
-            m->attr = args[5].i;
-            m->clr = args[6].i;
-            (void) strncpy(m->str, str, sizeof m->str - 1);
-            m->str[sizeof m->str - 1] = '\0';
-            m->itemflags = (unsigned) args[8].i;
-            ++nh3ds_menu.n;
+                m->id = *(const ANY_P *) (const void *) (uintptr_t)
+                            args[2].i;
+                m->ch = ch;
+                m->gch = (char) args[4].i;
+                m->attr = args[5].i;
+                m->clr = args[6].i;
+                (void) strncpy(m->str, str, sizeof m->str - 1);
+                m->str[sizeof m->str - 1] = '\0';
+                if (strlen(str) >= sizeof m->str)
+                    nh3ds_log("[add_menu] item clipped: \"%s\"", str);
+                m->itemflags = (unsigned) args[8].i;
+                ++nh3ds_menu.n;
+            }
         }
     } else if (!strcmp(name, "shim_end_menu")) {
         const char *prompt = args[1].s;
@@ -3203,18 +3208,21 @@ main(int argc, char *argv[])
                         "cannot chdir to %s -- is the nethack/ data folder "
                         "(from the zip) on the SD card?", nh3ds_hackdir);
     } else {
-        nh3ds_trace = fopen("nh3ds.log", "w");
-        if (nh3ds_trace)
-            nh3ds_log("[start] NetHack 3DS phase 4a (stereo map), hackdir=%s",
-                      nh3ds_hackdir);
+        FILE *f;
         /* debug aid: force the 3D slider, dump both eyes as BMPs into
-         * a ring, and let demo mode hunt the down-stairs; a file
-         * starting with 'L' also pins the hero to the levitation
+         * a ring, and let the rig autopilot hunt the down-stairs; a
+         * file containing 'L' also pins the hero to the levitation
          * plane for a visual test of that layer */
         nh3ds_debug3d = (access("3drig", F_OK) == 0);
         if (nh3ds_debug3d) {
-            FILE *f = fopen("3drig", "r");
-
+            /* the trace log is a rig aid: an unconditional log would
+             * mean SD-card wear and clutter on every real player's
+             * card */
+            nh3ds_trace = fopen("nh3ds.log", "w");
+            if (nh3ds_trace)
+                nh3ds_log("[start] NetHack 3DS phase 4a (stereo map), "
+                          "hackdir=%s", nh3ds_hackdir);
+            f = fopen("3drig", "r");
             if (f) {
                 char flagbuf[16];
 
