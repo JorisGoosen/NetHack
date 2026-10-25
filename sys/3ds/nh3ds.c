@@ -1,4 +1,4 @@
-/* NetHack 5.0 nh3ds.c    $NHDT-Date: 1792928357 2026/10/25 12:39:17 $  $NHDT-Branch: 3ds $:$NHDT-Revision: 1.17 $ */
+/* NetHack 5.0 nh3ds.c    $NHDT-Date: 1792928538 2026/10/25 12:42:18 $  $NHDT-Branch: 3ds $:$NHDT-Revision: 1.18 $ */
 /* Copyright (c) the NetHack 3DS port contributors, 2026.                */
 /* NetHack may be freely redistributed.  See license for details.        */
 
@@ -2302,12 +2302,24 @@ nh3ds_menu_pick(int how, MENU_ITEM_P **menulist)
                     cursor = i;
                     break;
                 }
+            if (i < 0) /* top of the list: scroll over to the bottom */
+                for (i = nh3ds_menu.n - 1; i > cursor; --i)
+                    if (nh3ds_menu_selectable(i)) {
+                        cursor = i;
+                        break;
+                    }
         } else if (down & KEY_DDOWN) {
             for (i = cursor + 1; i < nh3ds_menu.n; ++i)
                 if (nh3ds_menu_selectable(i)) {
                     cursor = i;
                     break;
                 }
+            if (i == nh3ds_menu.n) /* bottom: scroll over to the top */
+                for (i = 0; i < cursor; ++i)
+                    if (nh3ds_menu_selectable(i)) {
+                        cursor = i;
+                        break;
+                    }
         } else if (down & KEY_DLEFT) {
             cursor -= 26;
             if (cursor < 0)
@@ -2448,10 +2460,6 @@ nh3ds_ext_menu(void)
                                    nh3ds_ext.filter, nh3ds_ext.flen))
                 nh3ds_ext.match[nh3ds_ext.nm++] = nh3ds_ext.idx[i];
 
-        if (filter_changed) { /* new filter: jump to the first match */
-            nh3ds_ext.cursor = 0;
-            nh3ds_ext.mtop = 0;
-        }
         /* clamp the cursor into the current match list */
         if (nh3ds_ext.cursor >= nh3ds_ext.nm)
             nh3ds_ext.cursor = nh3ds_ext.nm - 1;
@@ -2494,9 +2502,13 @@ nh3ds_ext_menu(void)
         } else if (down & KEY_DUP) {
             if (nh3ds_ext.cursor > 0)
                 --nh3ds_ext.cursor;
+            else
+                nh3ds_ext.cursor = nh3ds_ext.nm - 1; /* wrap to bottom */
         } else if (down & KEY_DDOWN) {
             if (nh3ds_ext.cursor < nh3ds_ext.nm - 1)
                 ++nh3ds_ext.cursor;
+            else
+                nh3ds_ext.cursor = 0; /* wrap to top */
         } else if (down & KEY_B) {
             if (nh3ds_ext.flen) {
                 nh3ds_ext.filter[--nh3ds_ext.flen] = '\0';
@@ -2511,6 +2523,10 @@ nh3ds_ext_menu(void)
                 nh3ds_full_redraw();
                 return nh3ds_ext.match[nh3ds_ext.cursor];
             }
+        }
+        if (filter_changed) { /* new filter: jump to the first match */
+            nh3ds_ext.cursor = 0;
+            nh3ds_ext.mtop = 0;
         }
     }
 }
