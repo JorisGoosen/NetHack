@@ -314,6 +314,12 @@ submodules:
 (files in top directory)
 pdcurses     pdcursesmod
 
+sys/3ds:
+(files for Nintendo 3DS version)
+PLAN.md                README.3ds             README.md
+defaults.nh            icon.png               nh3ds.c
+nh3dslib.c
+
 sys/amiga:
 (files for Amiga versions)
 NHinfo.uu        README.amiga     amidos.c         amifont.uu
