@@ -1,4 +1,4 @@
-/* NetHack 5.0 nh3ds.c    $NHDT-Date: 1792927630 2026/10/25 12:27:10 $  $NHDT-Branch: 3ds $:$NHDT-Revision: 1.15 $ */
+/* NetHack 5.0 nh3ds.c    $NHDT-Date: 1792928036 2026/10/25 12:33:56 $  $NHDT-Branch: 3ds $:$NHDT-Revision: 1.16 $ */
 /* Copyright (c) the NetHack 3DS port contributors, 2026.                */
 /* NetHack may be freely redistributed.  See license for details.        */
 
@@ -53,6 +53,7 @@
 
 #include "hack.h"       /* svp.plname, iflags, flags, NHW_*, ... */
 #include "func_tab.h"   /* extcmdlist, CMD_* flags (not in hack.h) */
+#include "dlb.h"        /* dlb_fopen: help/data.base live in nhdat */
 
 #include <3ds.h>
 #include <citro2d.h>
@@ -297,6 +298,9 @@ static unsigned char nh3ds_wintype[NH3DS_MAXWINID]; /* NHW_* + 1, 0 = none */
  * we render on the bottom screen */
 #define NH3DS_POPLINES 80
 #define NH3DS_POPLINELEN 128
+/* display_file page budget: content rows that fit between the prompt
+ * row and the "[A] continue" row of the bottom-screen popup */
+#define NH3DS_PAGEROWS (BOT_ROWS - 3)
 static winid nh3ds_pop_win = -1;
 static char nh3ds_pop_lines[NH3DS_POPLINES][NH3DS_POPLINELEN];
 static int nh3ds_pop_n;
@@ -1186,12 +1190,19 @@ nh3ds_draw_bot_msgs(void)
     nh3ds_bot_buttons();
 }
 
-/* wait for any button press (edge-triggered: must be released first).
- * Demo mode (no button ever pressed since boot): continue on our own
- * after ~1.5s so unattended runs flow through blocking displays. */
+/* the touch letter-keyboard overlay is open (it owns the taps) */
+static boolean nh3ds_keys_open;
+
+/* any button or tap since boot: once set, blocking displays wait for a
+ * real press instead of auto-continuing after a few frames (the rig
+ * relies on the auto-continue; a real player always touches something
+ * during name entry and role setup first) */
 static boolean nh3ds_any_button_ever;
 
-static void
+/* wait for any button press (edge-triggered: must be released first);
+ * returns the button bits, or 0 if it auto-continued because no
+ * interaction has happened yet */
+static u32
 nh3ds_wait_button(void)
 {
     u32 held;
@@ -1208,14 +1219,15 @@ nh3ds_wait_button(void)
         held = hidKeysHeld();
         if (held != 0) {
             nh3ds_any_button_ever = TRUE;
-            return;
+            return held;
         }
         if (nh3ds_any_button_ever)
             continue; /* a real player is present: wait indefinitely */
         if (++frames >= 6)
-            return; /* demo mode: auto-continue (90 frames would cost
-                     * seconds of wall time per --More-- at the
-                     * emulator's reduced speed) */
+            return 0; /* no interaction yet: auto-continue (a page wait
+                       * would cost seconds of wall time per --More--
+                       * at the emulator's reduced speed; the rig
+                       * depends on this) */
     }
 }
 
@@ -1275,6 +1287,90 @@ nh3ds_full_redraw(void)
     nh3ds_map_dirty = TRUE;
     nh3ds_st_dirty = TRUE;
     nh3ds_refresh();
+}
+
+/* rows the popup renderer will spend on s: same wrap rule as
+ * nh3ds_draw_popup (chop at BOT_COLS, back up to the last space) */
+static int
+nh3ds_wrap_rows(const char *s)
+{
+    int rows = 0;
+
+    while (*s) {
+        int n = 0;
+
+        while (s[n] && n < BOT_COLS)
+            ++n;
+        if (s[n]) { /* wrap at the last space within the chunk */
+            int j = n;
+
+            while (j > 0 && s[j] != ' ')
+                --j;
+            if (j > 0)
+                n = j;
+        }
+        ++rows;
+        s += n;
+        while (*s == ' ')
+            ++s;
+    }
+    return rows;
+}
+
+/* shim_display_file: page a data file (help, the data.base, history,
+ * guidebook excerpts -- dlb reaches into nhdat) onto the bottom screen
+ * through the popup buffer.  One screenful per button press, B skips
+ * the rest.  This used to be a silent no-op, which left '?' (the
+ * SELECT key) doing nothing at all. */
+static void
+nh3ds_display_file(const char *fname, boolean complain)
+{
+    dlb *fp;
+    char line[NH3DS_POPLINELEN];
+    boolean held = FALSE; /* line[] read but not shown yet */
+    boolean stop = FALSE;
+
+    fp = dlb_fopen(fname, "r");
+    if (!fp) {
+        if (complain)
+            pline("Cannot open %s.", fname);
+        nh3ds_log("[display_file] cannot open %s", fname);
+        return;
+    }
+    nh3ds_keys_open = FALSE; /* the popup owns the bottom now */
+    while (!stop) {
+        int rows = 0;
+
+        nh3ds_pop_n = 0;
+        nh3ds_pop_prompt[0] = '\0';
+        while (nh3ds_pop_n < NH3DS_POPLINES) {
+            int r;
+
+            if (!held) {
+                if (!dlb_fgets(line, (int) sizeof line, fp))
+                    break; /* end of file */
+                line[strcspn(line, "\r\n")] = '\0';
+                held = TRUE;
+            }
+            r = (line[0] != '\0') ? nh3ds_wrap_rows(line) : 1;
+            if (rows + r > NH3DS_PAGEROWS && nh3ds_pop_n > 0)
+                break; /* line[] stays held for the next page */
+            rows += r;
+            (void) strncpy(nh3ds_pop_lines[nh3ds_pop_n], line,
+                           NH3DS_POPLINELEN - 1);
+            nh3ds_pop_lines[nh3ds_pop_n][NH3DS_POPLINELEN - 1] = '\0';
+            ++nh3ds_pop_n;
+            held = FALSE;
+        }
+        if (!nh3ds_pop_n)
+            break; /* nothing left to show */
+        nh3ds_refresh();
+        nh3ds_draw_popup();
+        if (nh3ds_wait_button() & KEY_B)
+            stop = TRUE; /* skip the rest of the file */
+    }
+    (void) dlb_fclose(fp);
+    nh3ds_full_redraw();
 }
 
 /* prime the status formatter table (labels are port-owned; see the
@@ -1496,7 +1592,6 @@ nh3ds_detail(const char *s)
  * then NetHack specials ('>' '<' '^' '_' '$' '\' '=' '@' '!' and Esc
  * shown as "Es").  L = shift, R = ctrl, B closes; the newest messages
  * stay visible below so the prompt being answered can be read. */
-static boolean nh3ds_keys_open;
 #define OV_ROW0 2               /* 0-based console row of the first key */
 #define OV_STEP 4
 static const char nh3ds_ov_rows[5][11] = {
@@ -2643,7 +2738,7 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
             ++nh3ds_pop_n;
         }
     } else if (!strcmp(name, "shim_display_file")) {
-        nh3ds_log("[display_file] %s", args[0].s ? args[0].s : "");
+        nh3ds_display_file(args[0].s ? args[0].s : "", args[1].i != 0);
     } else if (!strcmp(name, "shim_start_menu")) {
         winid w = (winid) args[0].i;
 
