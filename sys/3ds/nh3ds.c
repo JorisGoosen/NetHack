@@ -79,7 +79,7 @@ extern void shim_graphics_set_callback(shim_callback_t cb);
 static const char *nh3ds_hackdir = "sdmc:/3ds/nethack";
 
 /* canned answers for the phase 1 stub */
-static const char *nh3ds_plname = "Wizard";
+static const char *nh3ds_plname = "Adventurer";
 
 /* ----------------------------------------------------------------------*/
 /* trace log                                                              */
@@ -242,7 +242,7 @@ static const unsigned char nh3ds_depth[NH3DS_D_LAYERS] = {
     6,  /* furniture / stairs up */
     8,  /* under the hero */
     10, /* floor */
-    18  /* stairs down / pits: a hole in the floor plane */
+    15  /* stairs down / pits: a hole in the floor plane */
 };
 
 /* what the top screen currently paints */
@@ -2426,25 +2426,6 @@ nh3ds_ext_menu(void)
     }
 }
 
-/* at character-creation prompts: give a real player a short window to
- * press a button; unattended runs fall through to the canned answers */
-static void
-nh3ds_detect_player(int frames)
-{
-    int f;
-
-    if (nh3ds_any_button_ever)
-        return;
-    for (f = 0; f < frames; ++f) {
-        hidScanInput();
-        gspWaitForVBlank();
-        if (hidKeysHeld() != 0) {
-            nh3ds_any_button_ever = TRUE;
-            return;
-        }
-    }
-}
-
 /* libctru software keyboard; returns FALSE when cancelled.  The text is
  * copied into buf (truncated to fit). */
 static boolean
@@ -2520,38 +2501,34 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
         iflags.use_background_glyph = TRUE;
         nh3ds_log("[init_nhwindows] window_inited=TRUE bg_glyph=TRUE");
     } else if (!strcmp(name, "shim_player_selection")) {
-        nh3ds_detect_player(180); /* 3s to press a button */
-        if (nh3ds_any_button_ever) {
-            /* real play: generic role/race/gender/alignment menus (the
-             * core's genl setup drives this windowport's own menus) */
+        if (nh3ds_debug3d) {
+            /* rig: unattended -- role_init() randomizes unspecified
+             * facets */
+            nh3ds_log("[player_selection] rig: role/race/gend/align random");
+        } else {
+            /* generic role/race/gender/alignment menus (the core's
+             * genl setup drives this windowport's own menus) */
             (void) genl_player_setup(80);
             nh3ds_log("[player_selection] genl setup done");
-        } else {
-            /* demo mode: role_init() randomizes unspecified facets */
-            nh3ds_log("[player_selection] canned: role/race/gend/align random");
         }
     } else if (!strcmp(name, "shim_player_selection_or_tty")) {
         rint = 0; /* FALSE: don't run the generic tty-style setup */
     } else if (!strcmp(name, "shim_askname")) {
-        nh3ds_detect_player(180); /* 3s to press a button */
-        if (nh3ds_any_button_ever) {
-            /* real play: software keyboard */
-            if (nh3ds_swkbd("Who are you?", svp.plname,
-                            sizeof svp.plname))
-                nh3ds_log("[askname] swkbd plname=\"%s\"", svp.plname);
-            else {
-                (void) strncpy(svp.plname, nh3ds_plname,
-                               sizeof svp.plname - 1);
-                svp.plname[sizeof svp.plname - 1] = '\0';
-                nh3ds_log("[askname] swkbd cancelled, using \"%s\"",
-                          svp.plname);
-            }
-        } else {
-            /* demo mode: canned name */
+        if (nh3ds_debug3d) {
+            /* rig: canned name, unattended */
             (void) strncpy(svp.plname, nh3ds_plname,
                            sizeof svp.plname - 1);
             svp.plname[sizeof svp.plname - 1] = '\0';
-            nh3ds_log("[askname] canned plname=\"%s\"", svp.plname);
+            nh3ds_log("[askname] rig canned plname=\"%s\"", svp.plname);
+        } else if (nh3ds_swkbd("Who are you?", svp.plname,
+                               sizeof svp.plname)) {
+            nh3ds_log("[askname] swkbd plname=\"%s\"", svp.plname);
+        } else {
+            (void) strncpy(svp.plname, nh3ds_plname,
+                           sizeof svp.plname - 1);
+            svp.plname[sizeof svp.plname - 1] = '\0';
+            nh3ds_log("[askname] swkbd cancelled, using \"%s\"",
+                      svp.plname);
         }
     } else if (!strcmp(name, "shim_get_nh_event")) {
         /* phase 2b: poll hid here */
@@ -2707,17 +2684,18 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
         if (w != nh3ds_menu.win || !nh3ds_menu.active) {
             rint = -1; /* stale or unbuffered window: cancelled */
         } else if (how == PICK_NONE) {
-            /* display-only list: show it and wait for a key (tty-like) */
-            if (nh3ds_any_button_ever) {
+            /* display-only list: show it and wait for a key (tty-like);
+             * the rig dismisses it unattended */
+            if (!nh3ds_debug3d) {
                 nh3ds_menu_render(-1);
                 nh3ds_wait_button();
                 nh3ds_full_redraw();
             }
             nh3ds_menu.active = FALSE;
             rint = 0;
-        } else if (!nh3ds_any_button_ever) {
-            /* demo mode: cancel every interactive menu so unattended
-             * runs keep flowing */
+        } else if (nh3ds_debug3d) {
+            /* rig: cancel every interactive menu so unattended runs
+             * keep flowing */
             nh3ds_menu.active = FALSE;
             rint = -1;
         } else {
@@ -2834,20 +2812,14 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
         char def = (char) args[2].i;
         char ans = 0;
 
-        /* relaunch friendliness in demo mode: a stale lock file from a
+        /* relaunch friendliness under the rig: a stale lock file from a
          * killed run prompts "There is already a game in progress under
          * your name.  Destroy old game?" -- answer yes automatically so
          * unattended save/restore testing keeps working */
-        if (!nh3ds_any_button_ever) {
-            if (strstr(query, "Destroy old game"))
-                ans = 'y';
-            else if (strstr(query, "eat it?"))
-                ans = 'y'; /* demo heroes never shop, they graze */
-            else
-                ans = def ? def : 'n';
-            rint = ans;
-            nh3ds_log("[yn demo def='%c'] %s -> '%c'", def ? def : '?',
-                      query, ans);
+        if (nh3ds_debug3d && (strstr(query, "Destroy old game")
+                              || strstr(query, "eat it?"))) {
+            rint = 'y'; /* rig heroes never shop, they graze */
+            nh3ds_log("[yn rig] %s -> 'y'", query);
         } else {
             /* real play: the query wraps in the detail pane, the touch
              * keyboard answers with the exact choice letter, and the
