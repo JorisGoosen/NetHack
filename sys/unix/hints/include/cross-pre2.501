@@ -497,7 +497,7 @@ LUA_TARGET_CFLAGS = $(TARGET_CFLAGS)
 # libstdc++ pulls in)
 override TARGET_CXXFLAGS = $(TARGET_CFLAGS) -DHAS_STDINT_H -std=gnu++17
 override TARGET_LFLAGS = $(3DS_ARCH) -mword-relocations -L$(LIBCTRU)/lib
-override TARGET_LIBS += -lctru -lm
+override TARGET_LIBS += -lcitro2d -lcitro3d -lctru -lm
 
 override REGEXOBJ = $(TARGETPFX)cppregex.o
 override SYSSRC = ../sys/libnh/libnhmain.c \

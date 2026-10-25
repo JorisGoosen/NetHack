@@ -31,6 +31,22 @@
  * canned answer (alternating 'm' prefix + '.' rest); real button input
  * arrives in phase 2b.
  *
+ * Phase 4a: stereoscopic depth.  The top screen is now a citro2d stereo
+ * viewport (the bottom screen keeps the console).  Map glyphs are drawn
+ * as sprites from an atlas of the same 8x8 console font (white pixels
+ * on transparent) on depth layers: wall tops on the screen plane,
+ * entities (hero, monsters, objects) on an intermediate plane, floor
+ * terrain deepest, with stairs down / pits below the floor plane and
+ * stairs up raised above it.  Each layer's horizontal parallax scales
+ * with the 3D slider (at 0 the picture collapses to the old flat text
+ * view; only the left eye is drawn then).  Levitation or flight raises
+ * the hero one plane; the last thing the hero's tile showed before the
+ * hero glyph covered it (plus the terrain the core reports beneath the
+ * hero via the background glyph) is drawn on its own layer just above
+ * the floor.  A "3drig" file in the playground forces the slider to
+ * 1.0, dumps both eyes as BMPs every 64 frames and puts demo mode on a
+ * wander-and-take-stairs autopilot.
+ *
  * Build:  make CROSS_TO_3DS=1 all        (see sys/unix/hints/include/
  *         make CROSS_TO_3DS=1 3dspkg      cross-pre2.501 for the flags)
  */
@@ -39,6 +55,7 @@
 #include "func_tab.h"   /* extcmdlist, CMD_* flags (not in hack.h) */
 
 #include <3ds.h>
+#include <citro2d.h>
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -176,10 +193,95 @@ static winid nh3ds_nextwin = 1;   /* synthetic winid counter */
 struct nh3ds_cell {
     char c;                     /* ttychar from glyph_info */
     signed char color;          /* gm.sym.color, -1 = default */
+    int glyph;                  /* the display entity (glyph_is_* tests) */
+    unsigned short gflags;      /* gm.glyphflags (MG_HERO, ...) */
 };
 static struct nh3ds_cell nh3ds_map[ROWNO][COLNO];
+/* background terrain per cell (print_glyph's bkglyphinfo; delivered
+ * only when iflags.use_background_glyph is set -- we turn it on in
+ * shim_init_nhwindows): the floor plane beneath objects, monsters and
+ * the hero */
+static struct nh3ds_cell nh3ds_mapbg[ROWNO][COLNO];
+/* the last foreground glyph each cell showed while the hero was not
+ * standing on it: on the hero's tile this is what the hero stands on */
+static struct nh3ds_cell nh3ds_mapunder[ROWNO][COLNO];
 static boolean nh3ds_map_dirty;
 static coordxy nh3ds_vx, nh3ds_vy; /* viewport origin (top-left cell) */
+static int nh3ds_cur_x = -1, nh3ds_cur_y = -1; /* map cursor (getpos:
+                                                * farlook/travel); the
+                                                * cube hides on the hero */
+static unsigned long nh3ds_mapgen; /* bumped by map clears (level
+                                    * changes): the sweep restarts */
+
+/* ----------------------------------------------------------------------*/
+/* stereoscopic depth rendering (P4a)                                     */
+/* ----------------------------------------------------------------------*/
+
+/* Depth layers, nearest (the screen plane) to deepest (behind it).
+ * Depths are pixels of horizontal eye separation at 3D slider = 1.0;
+ * the real slider scales all of them, so it acts as a depth fader from
+ * the old flat view (0) to the full diorama (1). */
+enum {
+    NH3DS_D_WALL = 0,   /* wall tops, closed/open doors, trees, iron
+                         * bars -- and all the UI text */
+    NH3DS_D_LEV,        /* the hero while levitating or flying */
+    NH3DS_D_ENTITY,     /* hero, monsters, objects (chests etc.) */
+    NH3DS_D_FURNITURE,  /* altar, grave, throne, sink, fountain, webs,
+                         * stairs/ladders up: raised above the floor */
+    NH3DS_D_UNDER,      /* what the hero stands on */
+    NH3DS_D_FLOOR,      /* floor terrain: room, corridor, ice, water,
+                         * lava, air, cloud, open drawbridges */
+    NH3DS_D_DOWN,       /* stairs/ladders down, pits, holes, trap doors:
+                         * openings below the floor plane */
+    NH3DS_D_LAYERS
+};
+static const unsigned char nh3ds_depth[NH3DS_D_LAYERS] = {
+    0,  /* wall tops / UI: the screen plane everything else recedes from */
+    2,  /* levitating hero */
+    4,  /* entities */
+    6,  /* furniture / stairs up */
+    8,  /* under the hero */
+    10, /* floor */
+    13  /* stairs down / pits: below the floor plane */
+};
+
+/* what the top screen currently paints */
+enum {
+    NH3DS_VM_GAME = 0,  /* map + messages + status + legend */
+    NH3DS_VM_MENU,      /* a buffered menu owns the top screen */
+    NH3DS_VM_EXT,       /* the ext-command list owns the top screen */
+    NH3DS_VM_EXIT       /* hold-on-exit screen (over the game view) */
+};
+static int nh3ds_view = NH3DS_VM_GAME;
+
+static boolean nh3ds_gpu_ok;
+static C3D_RenderTarget *nh3ds_rt_left, *nh3ds_rt_right;
+static boolean nh3ds_stereo;     /* whether gfxSet3D is currently on */
+static boolean nh3ds_debug3d;    /* "3drig" flag file seen at boot */
+static boolean nh3ds_debug_lev;  /* ...containing 'L': hero always on
+                                  * the levitation plane (visual test) */
+static boolean nh3ds_debug_sweep; /* ...containing 'M': magic-map +
+                                   * farlook cursor-sweep autopilot */
+static unsigned long nh3ds_frame_n;
+
+/* glyph atlas: the libctru console font (8x8, 1bpp, 256 chars -- the
+ * same font the old console view used) expanded to white pixels on
+ * transparent, swizzled to the PICA hardware texture layout.  Tinting
+ * per NetHack color turns the white pixels into colored glyphs while
+ * the background stays transparent, so lower depth layers show
+ * through. */
+extern const unsigned char default_font_bin[]; /* libctru font.bin.o */
+#define NH3DS_FONTCHARS 256
+#define NH3DS_ATLAS_W 256              /* 32 chars per atlas row */
+#define NH3DS_ATLAS_H 64               /* 8 atlas rows */
+static C3D_Tex nh3ds_glyph_tex;
+static Tex3DS_SubTexture nh3ds_glyph_sub[NH3DS_FONTCHARS];
+
+/* NetHack CLR_* (stored value; -1 = default) -> RGBA, filled at init */
+static u32 nh3ds_rgb[16];
+static C2D_ImageTint nh3ds_tints[16];
+static C2D_ImageTint nh3ds_tints_dim[16]; /* 30% brightness -- the
+                                           * under-the-hero glyphs */
 
 /* message ring: putstr(WIN_MESSAGE) + putmsghistory */
 #define NH3DS_NMSGS 64
@@ -219,6 +321,7 @@ static struct nh3ds_menu {
     boolean active;
     int n;
     int top;                     /* first visible item row */
+    int cursor;                  /* highlighted item (-1 = display only) */
     struct nh3ds_menuitem item[NH3DS_MAXMENU];
     char prompt[128];
 } nh3ds_menu;
@@ -267,74 +370,323 @@ static const char *const nh3ds_st_initfmt[MAXBLSTATS] = {
 };
 
 /* ----------------------------------------------------------------------*/
-/* console helpers                                                        */
+/* console helpers (bottom screen only -- the top screen is citro2d)      */
 /* ----------------------------------------------------------------------*/
 
-static PrintConsole nh3ds_topcon, nh3ds_botcon;
-static PrintConsole *nh3ds_top, *nh3ds_bot;
+static PrintConsole nh3ds_botcon;
+static PrintConsole *nh3ds_bot;
 
 static void
-nh3ds_scr(int top) /* select which screen subsequent printf()s go to */
+nh3ds_scr(int top) /* select the console for printf(); only the bottom
+                    * screen has one (the top screen is the citro2d
+                    * stereo viewport), so any argument is ignored */
 {
-    consoleSelect(top ? nh3ds_top : nh3ds_bot);
-}
-
-/* NetHack CLR_* color to an ANSI SGR sequence; CLR_BLACK is forced to
- * bright black (dark gray) because the console background is black */
-static const char *
-nh3ds_esc(int clr)
-{
-    static char buf[12];
-
-    if (clr <= 0)               /* NO_COLOR and CLR_BLACK */
-        return clr == 0 ? "\x1b[30;1m" : "\x1b[0m";
-    if (clr < 8) {
-        buf[0] = '\0';
-        (void) sprintf(buf, "\x1b[3%dm", clr);
-    } else {
-        buf[0] = '\0';
-        (void) sprintf(buf, "\x1b[3%d;1m", clr - 8);
-    }
-    return buf;
+    (void) top;
+    consoleSelect(nh3ds_bot);
 }
 
 /* ----------------------------------------------------------------------*/
-/* renderers                                                              */
+/* GPU renderer: glyph atlas, text, the layered stereo map                */
 /* ----------------------------------------------------------------------*/
 
+/* expand the libctru console font into a white-on-transparent RGBA
+ * atlas and swizzle it into the PICA's 8x8-morton-tile texture layout
+ * (reference: citra's texture_codec.h) */
 static void
-nh3ds_draw_map(void)
+nh3ds_atlas_init(void)
 {
-    char line[MAP_VIEW_COLS * 10 + 24];
-    int cy, mx;
-    int lastclr = -99;
+    /* within an 8x8 tile, row y starts at morton_row[y] texels and
+     * column x adds morton_x[x]; linear image row r lands on morton
+     * row r (verified empirically: sprite row s samples morton row s,
+     * so storing the glyph rows in order keeps them upright) */
+    static const u32 morton_row[8] = { 0x00, 0x02, 0x08, 0x0A, 0x20, 0x22,
+                                       0x28, 0x2A };
+    static const u32 morton_x[8] = { 0x00, 0x01, 0x04, 0x05, 0x10, 0x11,
+                                     0x14, 0x15 };
+    static u32 linbuf[NH3DS_ATLAS_W * NH3DS_ATLAS_H];
+    static u32 tiled[NH3DS_ATLAS_W * NH3DS_ATLAS_H];
+    int ch, r, x, tx, ty;
 
-    nh3ds_scr(1);
-    for (cy = 0; cy < MAP_ROWS; ++cy) {
-        char *p = line;
-        int my = (int) nh3ds_vy + cy;
+    for (ch = 0; ch < NH3DS_FONTCHARS; ++ch) {
+        int ax = (ch & 31) * 8, ay = (ch >> 5) * 8;
 
-        p += sprintf(p, "\x1b[%d;1H", MAP_ROW0 + cy + 1);
-        lastclr = -99;
-        for (mx = 0; mx < MAP_VIEW_COLS; ++mx) {
-            int cx = (int) nh3ds_vx + mx;
-            char c = ' ';
-            int clr = -1;
+        for (r = 0; r < 8; ++r) {
+            u8 bits = default_font_bin[ch * 8 + r];
+            u32 *dst = &linbuf[(ay + r) * NH3DS_ATLAS_W + ax];
 
-            if (my >= 0 && my < ROWNO && cx >= 0 && cx < COLNO) {
-                c = nh3ds_map[my][cx].c ? nh3ds_map[my][cx].c : ' ';
-                clr = nh3ds_map[my][cx].color;
-            }
-            if (clr != lastclr) {
-                p += sprintf(p, "%s", nh3ds_esc(clr));
-                lastclr = clr;
-            }
-            *p++ = c;
+            for (x = 0; x < 8; ++x)
+                dst[x] = (bits & (0x80u >> x)) ? 0xFFFFFFFFu : 0u;
         }
-        *p++ = '\0';
-        printf("%s\x1b[0m", line);
     }
-    nh3ds_map_dirty = FALSE;
+    for (ty = 0; ty < NH3DS_ATLAS_H / 8; ++ty) {
+        for (tx = 0; tx < NH3DS_ATLAS_W / 8; ++tx) {
+            u32 *tile = &tiled[(ty * (NH3DS_ATLAS_W / 8) + tx) * 64];
+
+            for (r = 0; r < 8; ++r) {
+                const u32 *src =
+                    &linbuf[(ty * 8 + r) * NH3DS_ATLAS_W + tx * 8];
+                u32 moff = morton_row[r];
+
+                for (x = 0; x < 8; ++x)
+                    tile[moff + morton_x[x]] = src[x];
+            }
+        }
+    }
+    if (!C3D_TexInit(&nh3ds_glyph_tex, NH3DS_ATLAS_W, NH3DS_ATLAS_H,
+                     GPU_RGBA8))
+        return;
+    C3D_TexUpload(&nh3ds_glyph_tex, tiled);
+    C3D_TexSetFilter(&nh3ds_glyph_tex, GPU_NEAREST, GPU_NEAREST);
+    C3D_TexSetWrap(&nh3ds_glyph_tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+    C3D_TexFlush(&nh3ds_glyph_tex);
+    for (ch = 0; ch < NH3DS_FONTCHARS; ++ch) {
+        int ax = (ch & 31) * 8, ay = (ch >> 5) * 8;
+
+        nh3ds_glyph_sub[ch].width = 8;
+        nh3ds_glyph_sub[ch].height = 8;
+        nh3ds_glyph_sub[ch].left = (float) ax / NH3DS_ATLAS_W;
+        nh3ds_glyph_sub[ch].right = (float) (ax + 8) / NH3DS_ATLAS_W;
+        nh3ds_glyph_sub[ch].top = 1.0f - (float) ay / NH3DS_ATLAS_H;
+        nh3ds_glyph_sub[ch].bottom =
+            1.0f - (float) (ay + 8) / NH3DS_ATLAS_H;
+    }
+}
+
+/* the NetHack classic palette; index by the stored color value
+ * (-1/default maps to NO_COLOR's light gray, like the console did) */
+static void
+nh3ds_palette_init(void)
+{
+    nh3ds_rgb[0] = C2D_Color32(110, 110, 110, 255); /* CLR_BLACK */
+    nh3ds_rgb[1] = C2D_Color32(255, 64, 64, 255);   /* CLR_RED */
+    nh3ds_rgb[2] = C2D_Color32(0, 208, 0, 255);     /* CLR_GREEN */
+    nh3ds_rgb[3] = C2D_Color32(176, 112, 32, 255);  /* CLR_BROWN */
+    nh3ds_rgb[4] = C2D_Color32(96, 112, 255, 255);  /* CLR_BLUE */
+    nh3ds_rgb[5] = C2D_Color32(255, 0, 255, 255);   /* CLR_MAGENTA */
+    nh3ds_rgb[6] = C2D_Color32(0, 224, 224, 255);   /* CLR_CYAN */
+    nh3ds_rgb[7] = C2D_Color32(176, 176, 176, 255); /* CLR_GRAY */
+    nh3ds_rgb[8] = C2D_Color32(200, 200, 200, 255); /* NO_COLOR/default */
+    nh3ds_rgb[9] = C2D_Color32(255, 144, 0, 255);   /* CLR_ORANGE */
+    nh3ds_rgb[10] = C2D_Color32(0, 255, 0, 255);    /* BRIGHT_GREEN */
+    nh3ds_rgb[11] = C2D_Color32(255, 232, 0, 255);  /* CLR_YELLOW */
+    nh3ds_rgb[12] = C2D_Color32(136, 152, 255, 255);/* BRIGHT_BLUE */
+    nh3ds_rgb[13] = C2D_Color32(255, 128, 255, 255);/* BRIGHT_MAGENTA */
+    nh3ds_rgb[14] = C2D_Color32(128, 255, 255, 255);/* BRIGHT_CYAN */
+    nh3ds_rgb[15] = C2D_Color32(255, 255, 255, 255);/* CLR_WHITE */
+}
+
+static int
+nh3ds_tintidx(int clr)
+{
+    return (clr < 0 || clr > 15) ? 8 : clr;
+}
+
+/* the palette at greatly reduced brightness (C2D_Color32 packs ABGR):
+ * the under-the-hero glyphs use it so they stay out of the hero glyph's
+ * way when the slider is near the bottom and the layers overlap */
+static u32
+nh3ds_dim_rgb(u32 c)
+{
+    u32 r = (c & 0xFFu) * 3 / 10;
+    u32 g = ((c >> 8) & 0xFFu) * 3 / 10;
+    u32 b = ((c >> 16) & 0xFFu) * 3 / 10;
+
+    return (c & 0xFF000000u) | (b << 16) | (g << 8) | r;
+}
+
+/* one 8x8 glyph sprite at pixel position (px,py); spaces and unknown
+ * characters draw nothing (the atlas background is transparent, so
+ * deeper layers show through the gaps); `dim` picks the reduced-
+ * brightness tint (under-the-hero layer) */
+static void
+nh3ds_glyph(char chr, int clr, float px, float py, boolean dim)
+{
+    unsigned ch = (unsigned char) chr;
+    C2D_Image img;
+
+    if (ch == ' ' || ch == '\0')
+        return;
+    if (ch >= NH3DS_FONTCHARS)
+        ch = '?';
+    img.tex = &nh3ds_glyph_tex;
+    img.subtex = &nh3ds_glyph_sub[ch];
+    (void) C2D_DrawImageAt(img, px, py, 0.5f,
+                           dim ? &nh3ds_tints_dim[nh3ds_tintidx(clr)]
+                               : &nh3ds_tints[nh3ds_tintidx(clr)],
+                           1.0f, 1.0f);
+}
+
+/* a text run on the UI plane (screen depth): col/row in 8x8 cells */
+static void
+nh3ds_text(int col, int row, const char *s, int clr)
+{
+    float px = (float) (col * 8);
+    float py = (float) (row * 8);
+
+    for (; *s; ++s, px += 8.0f)
+        nh3ds_glyph(*s, clr, px, py, FALSE);
+}
+
+/* is this glyph flat terrain that belongs on the floor plane? */
+static boolean
+nh3ds_flat_glyph(int glyph)
+{
+    int c;
+
+    if (!glyph_is_cmap(glyph))
+        return FALSE;
+    c = glyph_to_cmap(glyph);
+    return is_cmap_room(c) || c == S_corr || c == S_litcorr || c == S_stone
+           || c == S_engroom || c == S_engrcorr || c == S_ice || c == S_air
+           || c == S_cloud || c == S_pool || c == S_water || c == S_lava
+           || c == S_ndoor || c == S_vodbridge || c == S_hodbridge;
+}
+
+/* which depth layer does a foreground glyph belong to?  (The hero's
+ * own glyph is decided per cell -- see nh3ds_cell_layer.) */
+static int
+nh3ds_glyph_layer(int glyph)
+{
+    int c, tt;
+
+    if (glyph_is_cmap(glyph)) {
+        c = glyph_to_cmap(glyph);
+        if (is_cmap_stairs(c))
+            return (c == S_upstair || c == S_upladder || c == S_brupstair
+                    || c == S_brupladder) ? NH3DS_D_FURNITURE : NH3DS_D_DOWN;
+        if (is_cmap_wall(c) || c == S_tree || c == S_bars || c == S_lavawall
+            || c == S_vcdbridge || c == S_hcdbridge
+            || c == S_hcdoor || c == S_vcdoor || c == S_hodoor
+            || c == S_vodoor)
+            return NH3DS_D_WALL;
+        if (c == S_altar || c == S_grave || c == S_throne || c == S_sink
+            || c == S_fountain)
+            return NH3DS_D_FURNITURE;
+        return NH3DS_D_FLOOR;
+    }
+    if (glyph_is_trap(glyph)) {
+        tt = glyph_to_trap(glyph);
+        if (is_pit(tt) || is_hole(tt))
+            return NH3DS_D_DOWN;    /* an opening below the floor */
+        return (tt == WEB) ? NH3DS_D_FURNITURE : NH3DS_D_FLOOR;
+    }
+    if (glyph_is_object(glyph) || glyph_is_monster(glyph)
+        || glyph_is_swallow(glyph) || glyph_is_explosion(glyph)
+        || glyph_is_warning(glyph) || glyph_is_invisible(glyph))
+        return NH3DS_D_ENTITY;
+    return NH3DS_D_WALL;
+}
+
+/* layer of a map cell; the hero's glyph rises a plane while
+ * levitating or flying */
+static int
+nh3ds_cell_layer(const struct nh3ds_cell *cell)
+{
+    if (cell->gflags & MG_HERO) {
+        if (nh3ds_debug_lev)
+            return NH3DS_D_LEV; /* visual test of the levitation plane */
+        return (nh3ds_st_cond & (BL_MASK_LEV | BL_MASK_FLY))
+                   ? NH3DS_D_LEV : NH3DS_D_ENTITY;
+    }
+    return nh3ds_glyph_layer(cell->glyph);
+}
+
+/* the map viewport for one eye: every glyph drawn on its layer's
+ * plane; `eye` is -1 (left) or +1 (right), `slider` scales the
+ * parallax (0 collapses all layers onto the screen plane) */
+static void
+nh3ds_draw_map_eye(float eye, float slider)
+{
+    int layer;
+    int hx = -1, hy = -1;
+
+    /* painter's order: the deepest layer first */
+    for (layer = NH3DS_D_DOWN; layer >= NH3DS_D_WALL; --layer) {
+        float dx = eye * 0.5f * slider * (float) nh3ds_depth[layer];
+        int cy, mx;
+
+        if (layer == NH3DS_D_UNDER && slider < 0.05f)
+            continue; /* flat mode: the under-glyphs would only smear
+                       * into the hero glyph -- like tty, the hero
+                       * hides what it stands on */
+
+        for (cy = 0; cy < MAP_ROWS; ++cy) {
+            int my = (int) nh3ds_vy + cy;
+            float py = (float) ((MAP_ROW0 + cy) * 8);
+
+            if (my < 0 || my >= ROWNO)
+                continue;
+            for (mx = 0; mx < MAP_VIEW_COLS; ++mx) {
+                int cx = (int) nh3ds_vx + mx;
+                struct nh3ds_cell *cell, *bg, *un;
+                int lay;
+                float px;
+
+                if (cx < 0 || cx >= COLNO)
+                    continue;
+                cell = &nh3ds_map[my][cx];
+                bg = &nh3ds_mapbg[my][cx];
+                un = &nh3ds_mapunder[my][cx];
+                if (cell->gflags & MG_HERO)
+                    hx = cx, hy = my;
+                if (!cell->c || cell->c == ' ')
+                    continue;
+                lay = nh3ds_cell_layer(cell);
+                px = (float) (mx * 8) + dx;
+                if (lay == layer)
+                    nh3ds_glyph(cell->c, cell->color, px, py, FALSE);
+                /* terrain behind whatever stands on it -- not behind
+                 * walls (they have no floor footprint) and not under
+                 * the floor's own glyphs (that would double-draw) */
+                if (layer == NH3DS_D_FLOOR && lay != NH3DS_D_WALL
+                    && lay != NH3DS_D_FLOOR && bg->c && bg->c != ' ')
+                    /* the tty shows the primary (above) glyph on this
+                     * cell, so the terrain behind it is "under
+                     * something" -- keep it well out of its way */
+                    nh3ds_glyph(bg->c, bg->color, px, py, TRUE);
+                /* what the hero stands on, one plane above the floor;
+                 * stays put while the hero levitates away from it.
+                 * Floor-like glyphs are skipped (the background terrain
+                 * already shows them) and so are stale monsters and
+                 * transient effect glyphs. */
+                if (layer == NH3DS_D_UNDER && (cell->gflags & MG_HERO)
+                    && un->c && un->c != ' ' && un->c != bg->c
+                    && !nh3ds_flat_glyph(un->glyph)
+                    && !glyph_is_monster(un->glyph)
+                    && !glyph_is_swallow(un->glyph)
+                    && !glyph_is_explosion(un->glyph)
+                    && !glyph_is_warning(un->glyph))
+                    nh3ds_glyph(un->c, un->color, px, py, TRUE);
+            }
+        }
+    }
+
+    /* the map cursor (getpos -- farlook/travel targeting): a
+     * translucent lightblue cube around the targeted tile, two faces
+     * one step of depth either side of the tile's own plane; hidden
+     * while the cursor sits on the hero */
+    if (hx >= 0 && nh3ds_cur_x >= 0 && nh3ds_cur_y >= 0
+        && nh3ds_cur_y < ROWNO && nh3ds_cur_x < COLNO
+        && !(nh3ds_cur_x == hx && nh3ds_cur_y == hy)) {
+        struct nh3ds_cell *cur = &nh3ds_map[nh3ds_cur_y][nh3ds_cur_x];
+        float cdepth = (cur->c && cur->c != ' ')
+                          ? (float) nh3ds_depth[nh3ds_cell_layer(cur)]
+                          : (float) nh3ds_depth[NH3DS_D_FLOOR];
+        int cmx = nh3ds_cur_x - (int) nh3ds_vx;
+        int cmy = nh3ds_cur_y - (int) nh3ds_vy;
+
+        if (cmx >= 0 && cmx < MAP_VIEW_COLS && cmy >= 0 && cmy < MAP_ROWS) {
+            float cpx = (float) (cmx * 8);
+            float cpy = (float) ((MAP_ROW0 + cmy) * 8);
+
+            C2D_DrawRectSolid(cpx + eye * 0.5f * slider * (cdepth + 3.0f),
+                              cpy, 0.5f, 8.0f, 8.0f,
+                              C2D_Color32(136, 152, 255, 77));
+            C2D_DrawRectSolid(cpx + eye * 0.5f * slider * (cdepth - 3.0f),
+                              cpy, 0.5f, 8.0f, 8.0f,
+                              C2D_Color32(136, 152, 255, 77));
+        }
+    }
 }
 
 static void
@@ -342,7 +694,6 @@ nh3ds_draw_messages(void)
 {
     int i, oldest, n;
 
-    nh3ds_scr(1);
     oldest = (nh3ds_msg_head - nh3ds_msg_count + NH3DS_NMSGS) % NH3DS_NMSGS;
     oldest = (oldest + nh3ds_msg_count
               - (nh3ds_msg_count < MSG_ROWS ? nh3ds_msg_count : MSG_ROWS))
@@ -353,14 +704,21 @@ nh3ds_draw_messages(void)
 
         if (i < n)
             s = nh3ds_msgs[(oldest + i) % NH3DS_NMSGS];
-        printf("\x1b[%d;1H\x1b[0m%-50.50s", MSG_ROW0 + i + 1, s);
+        nh3ds_text(0, MSG_ROW0 + i, s, -1);
     }
-    nh3ds_msg_dirty = FALSE;
 }
 
 /* append one message line to the ring; word-wrap s at the bottom-screen
  * width (40) so long messages stay readable on both screens instead of
  * being truncated */
+
+/* shared by the 3ddebug walker helpers below */
+static const char nh3ds_dirkey[] = "hjklyubn";
+static const int nh3ds_dx8[8] = { -1, 1, 0, 0, -1, 1, -1, 1 };
+static const int nh3ds_dy8[8] = { 0, 0, -1, 1, -1, -1, 1, 1 };
+/* set/cleared by the message handler as hunger messages scroll by */
+static boolean nh3ds_demo_hungry;
+
 static void
 nh3ds_msg_add(const char *s)
 {
@@ -371,6 +729,13 @@ nh3ds_msg_add(const char *s)
         s = "";
     (void) strncpy(buf, s, NH3DS_MSGLEN - 1);
     buf[NH3DS_MSGLEN - 1] = '\0';
+    /* the 3ddebug walker grazes on this: hunger messages scroll by
+     * wrapped, but nh3ds_msg_add sees each full line once */
+    if (strstr(buf, "feel hungry") || strstr(buf, "feel weak")
+        || strstr(buf, "faint"))
+        nh3ds_demo_hungry = TRUE;
+    else if (strstr(buf, "no longer hungry"))
+        nh3ds_demo_hungry = FALSE;
     p = buf;
     while (*p) {
         char chunk[BOT_COLS + 1];
@@ -437,11 +802,8 @@ nh3ds_trim(char *s)
 static void
 nh3ds_st_row(int row, const int *flds, int nflds, boolean use_cond)
 {
-    char escbuf[TOP_COLS * 12 + 16];
-    char *p = escbuf;
-    int len = 0, i;
+    int col = 0, i;
 
-    p += sprintf(p, "\x1b[%d;1H", ST_ROW0 + row + 1);
     for (i = 0; i < nflds; ++i) {
         int fld = flds[i];
         char seg[TOP_COLS + 1];
@@ -456,10 +818,10 @@ nh3ds_st_row(int row, const int *flds, int nflds, boolean use_cond)
             (void) sprintf(seg, "%s", nh3ds_st_val[fld]);
         if (!*seg || !strcmp(seg, " "))
             continue;
-        if (len + (int) strlen(seg) > TOP_COLS)
+        if (col + (int) strlen(seg) > TOP_COLS)
             break;
-        p += sprintf(p, "%s%s", nh3ds_esc(nh3ds_st_color[fld]), seg);
-        len += (int) strlen(seg);
+        nh3ds_text(col, ST_ROW0 + row, seg, nh3ds_st_color[fld]);
+        col += (int) strlen(seg);
     }
     if (use_cond) {
         int k;
@@ -471,13 +833,12 @@ nh3ds_st_row(int row, const int *flds, int nflds, boolean use_cond)
             if ((nh3ds_st_cond & nh3ds_cond[k].mask) == 0L)
                 continue;
             (void) sprintf(seg, " %s", nh3ds_cond[k].tag);
-            if (len + (int) strlen(seg) > TOP_COLS)
+            if (col + (int) strlen(seg) > TOP_COLS)
                 break;
-            p += sprintf(p, "%s%s", nh3ds_esc(11 /* yellow */), seg);
-            len += (int) strlen(seg);
+            nh3ds_text(col, ST_ROW0 + row, seg, 11 /* yellow */);
+            col += (int) strlen(seg);
         }
     }
-    printf("%s\x1b[0m%-*s", escbuf, TOP_COLS - len, "");
 }
 
 static void
@@ -503,12 +864,10 @@ nh3ds_draw_status(void)
                           nh3ds_st_val[i]);
     }
 
-    nh3ds_scr(1);
     nh3ds_st_row(0, row1flds, (int) (sizeof row1flds / sizeof row1flds[0]),
                  FALSE);
     nh3ds_st_row(1, row2flds, (int) (sizeof row2flds / sizeof row2flds[0]),
                  TRUE);
-    nh3ds_st_dirty = FALSE;
 }
 
 static const char *const nh3ds_legend[TOP_ROWS - LEG_ROW0] = {
@@ -523,10 +882,245 @@ nh3ds_draw_legend(void)
 {
     int i;
 
-    nh3ds_scr(1);
     for (i = 0; i < TOP_ROWS - LEG_ROW0; ++i)
-        printf("\x1b[%d;1H\x1b[0m%-*s", LEG_ROW0 + i + 1, TOP_COLS,
-               nh3ds_legend[i]);
+        nh3ds_text(0, LEG_ROW0 + i, nh3ds_legend[i], -1);
+}
+
+/* ----------------------------------------------------------------------*/
+/* top-screen view compositor and the citro3d frame loop                  */
+/* ----------------------------------------------------------------------*/
+
+static int
+nh3ds_menu_selectable(int i); /* defined with the menu code below */
+
+/* the ext-command list state (drawn from the top-screen renderer) */
+#define NH3DS_EXTMAX 128
+static struct {
+    int idx[NH3DS_EXTMAX];   /* all available commands */
+    int match[NH3DS_EXTMAX]; /* visible after the prefix filter */
+    int n, nm, mtop, cursor, flen;
+    char filter[24];
+} nh3ds_ext;
+
+/* buffered menu on the top screen (rows: 0 prompt, 1..26 items,
+ * 28 footer) */
+static void
+nh3ds_draw_menu(void)
+{
+    int rows = 26, row, i, top = nh3ds_menu.top;
+    char line[128];
+
+    nh3ds_text(0, 0, nh3ds_menu.prompt, 15);
+    for (row = 0, i = top; i < nh3ds_menu.n && row < rows; ++i, ++row) {
+        const struct nh3ds_menuitem *m = &nh3ds_menu.item[i];
+        const char *tag = "  ";
+
+        if (nh3ds_menu_selectable(i)) {
+            tag = (nh3ds_menu.cursor == i) ? "> " : "  ";
+            if (m->itemflags & MENU_ITEMFLAGS_SELECTED)
+                tag = "* ";
+        }
+        if (m->ch && m->ch != ' ')
+            (void) sprintf(line, "%s%c) %s", tag, m->ch, m->str);
+        else
+            (void) sprintf(line, "%s%s", tag, m->str);
+        nh3ds_text(0, row + 1, line, nh3ds_menu_selectable(i) ? -1 : 14);
+    }
+    nh3ds_text(0, TOP_ROWS - 2, "pad=move A=ok B=cancel letter=select", 6);
+}
+
+/* ext-command list (rows: 0 "#filter_", 1..26 matches, 28 footer) */
+static void
+nh3ds_draw_ext(void)
+{
+    char line[64];
+    int i;
+
+    (void) sprintf(line, "#%.22s_", nh3ds_ext.filter);
+    nh3ds_text(0, 0, line, 15);
+    for (i = nh3ds_ext.mtop; i < nh3ds_ext.nm && i < nh3ds_ext.mtop + 26;
+         ++i) {
+        const struct ext_func_tab *ef = &extcmdlist[nh3ds_ext.match[i]];
+
+        (void) sprintf(line, "%s%-14.14s %.32s",
+                       (i == nh3ds_ext.cursor) ? "> " : "  ", ef->ef_txt,
+                       ef->ef_desc ? ef->ef_desc : "");
+        nh3ds_text(0, i - nh3ds_ext.mtop + 1, line, -1);
+    }
+    if (!nh3ds_ext.nm)
+        nh3ds_text(0, 1, "  (no matching command)", 1);
+    nh3ds_text(0, TOP_ROWS - 2, "A=do B=bsp START=cancel pad=move", 6);
+}
+
+/* hold-on-exit lines, written over the (frozen) game view */
+static void
+nh3ds_draw_exit(void)
+{
+    char line[TOP_COLS + 1];
+
+    if (nh3ds_lastwords[0]) {
+        (void) snprintf(line, sizeof line, "%.50s", nh3ds_lastwords);
+        nh3ds_text(0, 26, line, 1);
+    }
+    nh3ds_text(0, 28, "exit -- press START to return to the launcher", 6);
+}
+
+static void
+nh3ds_draw_view(float eye, float slider)
+{
+    switch (nh3ds_view) {
+    case NH3DS_VM_EXIT:
+        nh3ds_draw_messages();
+        nh3ds_draw_map_eye(eye, slider);
+        nh3ds_draw_status();
+        nh3ds_draw_exit();
+        break;
+    case NH3DS_VM_MENU:
+        nh3ds_draw_menu();
+        break;
+    case NH3DS_VM_EXT:
+        nh3ds_draw_ext();
+        break;
+    default: /* NH3DS_VM_GAME */
+        nh3ds_draw_messages();
+        nh3ds_draw_map_eye(eye, slider);
+        nh3ds_draw_status();
+        nh3ds_draw_legend();
+        break;
+    }
+}
+
+/* debug: write both eyes' top-screen framebuffers as 400x240 BMPs into
+ * a 32-slot ring (enabled by a "3drig" file in the playground) */
+static void
+nh3ds_debug_dump(void)
+{
+    static const char *const eye[2] = { "L", "R" };
+    gfx3dSide_t sides[2] = { GFX_LEFT, GFX_RIGHT };
+    char fn[24];
+    int i;
+
+    gspWaitForPPF(); /* wait for the display transfer into the LCD fb */
+    for (i = 0; i < 2; ++i) {
+        u8 *fb = (u8 *) gfxGetFramebuffer(GFX_TOP, sides[i], NULL, NULL);
+        u8 hdr[54], row[400 * 3];
+        u32 sz = 54u + 400u * 240u * 3u;
+        FILE *f;
+        int sx, sy;
+
+        if (!fb)
+            continue;
+        (void) sprintf(fn, "dump3d_%02lu_%s.bmp",
+                       (unsigned long) (nh3ds_frame_n / 64) % 32, eye[i]);
+        (void) memset(hdr, 0, sizeof hdr);
+        hdr[0] = 'B', hdr[1] = 'M';
+        hdr[2] = (u8) sz, hdr[3] = (u8) (sz >> 8);
+        hdr[4] = (u8) (sz >> 16), hdr[5] = (u8) (sz >> 24);
+        hdr[10] = 54;                /* pixel data offset */
+        hdr[14] = 40;                /* BITMAPINFOHEADER size */
+        hdr[18] = (u8) 400;          /* width, little-endian */
+        hdr[19] = (u8) (400 >> 8);
+        hdr[22] = (u8) 240;          /* height, little-endian */
+        hdr[23] = (u8) (240 >> 8);
+        hdr[26] = 1;                 /* planes */
+        hdr[28] = 24;                /* bits per pixel */
+        f = fopen(fn, "wb");
+        if (!f)
+            continue;
+        (void) fwrite(hdr, 1, sizeof hdr, f);
+        /* the framebuffer is 240x400, column-major with its origin at
+         * the screen's bottom-left: fb pixel p of column sx is screen
+         * row (239 - p); BMP rows are bottom-up (file row 0 = image
+         * bottom = screen bottom = framebuffer pixel 0), so ascending
+         * framebuffer rows land the image upright */
+        for (sy = 0; sy < 240; ++sy) {
+            for (sx = 0; sx < 400; ++sx) {
+                const u8 *px = fb + ((u32) sx * 240 + (u32) sy) * 3;
+
+                row[sx * 3] = px[0];
+                row[sx * 3 + 1] = px[1];
+                row[sx * 3 + 2] = px[2];
+            }
+            (void) fwrite(row, 1, sizeof row, f);
+        }
+        (void) fclose(f);
+    }
+}
+
+/* one citro3d frame: both eyes when the slider is up, else only the
+ * left one (a flat picture) */
+static void
+nh3ds_frame_draw(void)
+{
+    float slider = nh3ds_debug3d ? 1.0f : (float) osGet3DSliderState();
+    boolean stereo = slider > 0.001f;
+
+    if (stereo != nh3ds_stereo) {
+        gfxSet3D(stereo);
+        nh3ds_stereo = stereo;
+    }
+    C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+    C2D_TargetClear(nh3ds_rt_left, C2D_Color32(0, 0, 0, 255));
+    C2D_SceneBegin(nh3ds_rt_left);
+    C2D_Prepare();
+    nh3ds_draw_view(-1.0f, slider);
+    if (stereo) {
+        C2D_TargetClear(nh3ds_rt_right, C2D_Color32(0, 0, 0, 255));
+        C2D_SceneBegin(nh3ds_rt_right);
+        C2D_Prepare();
+        nh3ds_draw_view(1.0f, slider);
+    }
+    C3D_FrameEnd(C3D_FRAME_SYNCDRAW);
+}
+
+/* redraw the top screen; called whenever anything is dirty.  The LCD
+ * keeps scanning out the last transferred frame, so turns without
+ * visible changes cost nothing. */
+static void
+nh3ds_render_frame(void)
+{
+    if (!nh3ds_gpu_ok)
+        return;
+    nh3ds_frame_draw();
+    ++nh3ds_frame_n;
+    if (nh3ds_debug3d && nh3ds_frame_n % 64 == 0)
+        nh3ds_debug_dump();
+}
+
+static void
+nh3ds_gpu_init(void)
+{
+    int i;
+
+    nh3ds_gpu_ok = FALSE;
+    if (!C3D_Init(C3D_DEFAULT_CMDBUF_SIZE)) {
+        nh3ds_log("[gpu] C3D_Init failed");
+        return;
+    }
+    if (!C2D_Init(C2D_DEFAULT_MAX_OBJECTS)) {
+        C3D_Fini();
+        nh3ds_log("[gpu] C2D_Init failed");
+        return;
+    }
+    nh3ds_rt_left = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
+    nh3ds_rt_right = C2D_CreateScreenTarget(GFX_TOP, GFX_RIGHT);
+    if (!nh3ds_rt_left || !nh3ds_rt_right) {
+        C2D_Fini();
+        C3D_Fini();
+        nh3ds_log("[gpu] screen target creation failed");
+        return;
+    }
+    (void) C2D_SetTintMode(C2D_TintMult);
+    nh3ds_palette_init();
+    for (i = 0; i < 16; ++i) {
+        C2D_PlainImageTint(&nh3ds_tints[i], nh3ds_rgb[i], 1.0f);
+        C2D_PlainImageTint(&nh3ds_tints_dim[i], nh3ds_dim_rgb(nh3ds_rgb[i]),
+                           1.0f);
+    }
+    nh3ds_atlas_init();
+    gfxSet3D(FALSE);
+    nh3ds_stereo = FALSE;
+    nh3ds_gpu_ok = TRUE;
 }
 
 /* render the popup buffer (wrapped to BOT_COLS) onto the bottom screen */
@@ -615,8 +1209,10 @@ nh3ds_wait_button(void)
         }
         if (nh3ds_any_button_ever)
             continue; /* a real player is present: wait indefinitely */
-        if (++frames >= 90)
-            return; /* demo mode: auto-continue */
+        if (++frames >= 6)
+            return; /* demo mode: auto-continue (90 frames would cost
+                     * seconds of wall time per --More-- at the
+                     * emulator's reduced speed) */
     }
 }
 
@@ -651,7 +1247,6 @@ static void
 nh3ds_refresh(void)
 {
     if (nh3ds_msg_dirty) {
-        nh3ds_draw_messages();
         /* the bottom screen is the message-history tail; redraw it in
          * step.  (No guard for popups/menus needed: those waits are
          * synchronous inside our own handlers, so nh_poskey -- the only
@@ -660,17 +1255,19 @@ nh3ds_refresh(void)
          * which would block the tail forever if we tested pop_win.) */
         nh3ds_draw_bot_msgs();
     }
-    if (nh3ds_map_dirty)
-        nh3ds_draw_map();
-    if (nh3ds_st_dirty)
-        nh3ds_draw_status();
+    if (nh3ds_map_dirty || nh3ds_msg_dirty || nh3ds_st_dirty)
+        nh3ds_render_frame();
+    nh3ds_map_dirty = nh3ds_msg_dirty = nh3ds_st_dirty = FALSE;
 }
 
 /* full redraw after something else owned a screen (menus render on the
- * top screen and wipe the map) */
+ * top screen and wipe the map); hands the top screen back to the game
+ * view -- nothing else resets nh3ds_view once a menu or the ext-command
+ * list has claimed it */
 static void
 nh3ds_full_redraw(void)
 {
+    nh3ds_view = NH3DS_VM_GAME;
     nh3ds_msg_dirty = TRUE;
     nh3ds_map_dirty = TRUE;
     nh3ds_st_dirty = TRUE;
@@ -744,7 +1341,7 @@ static const struct nh3ds_verb nh3ds_verbs[] = {
     { 'z', "z:zap   ", 0 }, { 'Z', "Z:spell ", 0 }, { 'e', "e:eat   ", 0 },
     { 'r', "r:read  ", 0 }, { 'w', "w:wield ", 0 },
     { 't', "t:throw ", 0 }, { 'f', "f:fire  ", 0 }, { 'd', "d:drop  ", 0 },
-    { 'W', "W:wear  ", 0 }, { 'P', "P:puton ", 0 },
+    { ';', ";:look  ", 0 }, { '#', "#:loot  ", "loot" },
     { 'T', "T:tkoff ", 0 }, { 'R', "R:rmv   ", 0 }, { 'C', "C:call  ", 0 },
     { '*', "*:equip ", 0 }, { '#', "#:cmd   ", 0 },
     { '>', ">:down  ", 0 }, { '<', "<:up    ", 0 },
@@ -781,10 +1378,15 @@ nh3ds_bot_buttons(void)
 
     nh3ds_scr(0);
     for (r = 0; r < 5; ++r)
-        for (c = 0; c < 5; ++c)
-            printf("\x1b[%d;%dH\x1b[7m%-8.8s\x1b[0m",
-                   TBOT_ROW0 + r * TBOT_STEP + 1, c * TBOT_COLW + 1,
+        for (c = 0; c < 5; ++c) {
+            /* the drawn block covers exactly the pressable cells: a
+             * 2-row x 8-col button, like the keyboard's keys */
+            printf("\x1b[%d;%dH\x1b[44m        \x1b[0m",
+                   TBOT_ROW0 + r * TBOT_STEP + 1, c * TBOT_COLW + 1);
+            printf("\x1b[%d;%dH\x1b[44m\x1b[7m%-8.8s\x1b[0m",
+                   TBOT_ROW0 + r * TBOT_STEP + 2, c * TBOT_COLW + 1,
                    nh3ds_verbs[r * 5 + c].label);
+        }
     printf("\x1b[30;1H\x1b[36m%-40.40s",
            "L=shift R=travel  tap a button");
 }
@@ -984,39 +1586,26 @@ nh3ds_next_key(void) /* 0 = nothing to report this frame */
     u32 held, btns, dir;
     int key = 0;
     boolean repeatable = FALSE;
+    static float last_slider = -1.0f;
+
+    /* depth control without a keypress: re-render once when the 3D
+     * slider moves (the usual per-turn redraw would wait for a move) */
+    {
+        float slider = nh3ds_debug3d ? 1.0f : (float) osGet3DSliderState();
+
+        if (last_slider < 0.0f)
+            last_slider = slider;
+        if (slider != last_slider) {
+            last_slider = slider;
+            nh3ds_render_frame();
+        }
+    }
 
     hidScanInput();
     gspWaitForVBlank();
     held = hidKeysHeld(); /* KEY_UP.. include the circle pad */
     btns = held & (KEY_A | KEY_B | KEY_X | KEY_Y | KEY_START | KEY_SELECT);
     dir = held & (KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT);
-
-    if (nh3ds_keys_open) {
-        /* keys overlay: taps type characters, B closes, the rest of
-         * the pad is ignored while the overlay owns the bottom screen */
-        int tcol, trow;
-
-        if (nh3ds_tap(&tcol, &trow)) {
-            int ch = nh3ds_overlay_map(tcol, trow);
-
-            if (ch) {
-                nh3ds_any_button_ever = TRUE;
-                last_key = 0;
-                last_mask = 0;
-                frames_since = 0;
-                return ch;
-            }
-            return 0;
-        }
-        if (btns & KEY_B) {
-            nh3ds_keys_open = FALSE;
-            nh3ds_draw_bot_msgs();
-        }
-        last_key = 0;
-        last_mask = 0;
-        frames_since = 0;
-        return 0;
-    }
 
     if (dir) {
         if ((dir & KEY_UP) && (dir & KEY_LEFT))
@@ -1047,7 +1636,7 @@ nh3ds_next_key(void) /* 0 = nothing to report this frame */
                          * direction follows while R stays held */
         }
         repeatable = TRUE;
-    } else if (btns) {
+    } else if (!nh3ds_keys_open && btns) {
         if (btns & KEY_A)
             key = '.', repeatable = TRUE;
         else if (btns & KEY_B)
@@ -1063,6 +1652,41 @@ nh3ds_next_key(void) /* 0 = nothing to report this frame */
     }
     if (!dir)
         travel_armed = FALSE; /* R+dir re-arms from the start */
+
+    if (nh3ds_keys_open) {
+        /* keys overlay: taps type characters and B closes, but the
+         * d-pad stays live -- a direction prompt ("In what
+         * direction?") must be answerable with the pad while the
+         * overlay is up */
+        if (btns & KEY_B) {
+            nh3ds_keys_open = FALSE;
+            nh3ds_draw_bot_msgs();
+            last_key = 0;
+            last_mask = 0;
+            frames_since = 0;
+            return 0;
+        }
+        if (!key) {
+            int tcol, trow;
+
+            if (nh3ds_tap(&tcol, &trow)) {
+                int ch = nh3ds_overlay_map(tcol, trow);
+
+                if (ch) {
+                    nh3ds_any_button_ever = TRUE;
+                    last_key = 0;
+                    last_mask = 0;
+                    frames_since = 0;
+                    return ch;
+                }
+            }
+            last_key = 0;
+            last_mask = 0;
+            frames_since = 0;
+            return 0;
+        }
+        /* a d-pad direction: fall through so it answers the prompt */
+    }
 
     if (!key) {
         int tcol, trow;
@@ -1104,6 +1728,296 @@ nh3ds_next_key(void) /* 0 = nothing to report this frame */
     return key;
 }
 
+/* walkable for the 3ddebug autopilot: unseen cells ('\0' -- dark
+ * corridors do NOT reveal ahead, so the only way to traverse them is
+ * stepping into the unseen; a step that turns out to be real rock
+ * bumps harmlessly and the walker's failure feedback rotates away),
+ * floor-ish glyphs, and open doors (which share their '|'/'-' ttychars
+ * with walls, so tell them apart by the stored cmap glyph).  Walls,
+ * closed doors, iron bars and solid rock need 'o' or a way around.
+ * (strchr(" |-+", '\0') would wrongly report a match on the string
+ * terminator.) */
+static boolean
+nh3ds_is_open(const struct nh3ds_cell *cp)
+{
+    if (cp->c == '\0')
+        return TRUE; /* unseen: try it, bump-and-rotate if rock */
+    if (glyph_is_cmap(cp->glyph)) {
+        int cmap = glyph_to_cmap(cp->glyph);
+
+        if (cmap == S_hodoor || cmap == S_vodoor)
+            return TRUE; /* open door: walk through */
+        if (cmap == S_bars)
+            return FALSE; /* iron bars share '#' with corridors */
+    }
+    return !strchr(" |-+", cp->c);
+}
+
+/* one greedy step toward the nearest seen cell whose glyph char is
+ * `want` (dominant axis first, the other axis when blocked); returns
+ * the move key, or 0 when there is no such cell or no open way to it */
+static int
+nh3ds_demo_step_toward(char want, int hx, int hy)
+{
+    int tx = -1, ty = -1, x, y, dx, dy, nx, ny;
+
+    for (y = 0; y < ROWNO; ++y)
+        for (x = 0; x < COLNO; ++x)
+            if (nh3ds_map[y][x].c == want
+                && (tx < 0
+                    || abs(x - hx) + abs(y - hy)
+                       < abs(tx - hx) + abs(ty - hy)))
+                tx = x, ty = y;
+    if (tx < 0)
+        return 0;
+    dx = tx - hx, dy = ty - hy;
+    if (abs(dx) >= abs(dy) && dx) {
+        nx = hx + ((dx > 0) ? 1 : -1);
+        if (nx >= 0 && nx < COLNO && nh3ds_is_open(&nh3ds_map[hy][nx]))
+            return (dx > 0) ? 'l' : 'h';
+    }
+    if (dy) {
+        ny = hy + ((dy > 0) ? 1 : -1);
+        if (ny >= 0 && ny < ROWNO && nh3ds_is_open(&nh3ds_map[ny][hx]))
+            return (dy > 0) ? 'j' : 'k';
+    }
+    return 0;
+}
+
+/* 3ddebug autopilot: wander randomly (momentum -- keep one heading
+ * until blocked, then the next open direction), rest every 5th step,
+ * every 9th step head for the nearest visible closed door and open it
+ * once adjacent (rooms are inescapable for a random walker otherwise),
+ * search when stuck in a doorless nook, and descend when standing on
+ * '>'.  Deliberately dumb -- it only needs to steer the hero past
+ * enough terrain to exercise the depth layers in unattended emulator
+ * runs; real mapping and pathing live in the nethack MCP tooling, not
+ * in the front-end. */
+static int
+nh3ds_demo_chase(void)
+{
+    static int step, dir = 1, pending_dir;
+    static int last_hx = -1, last_hy = -1;
+    static int last_eat_x = -1, last_eat_y = -1;
+    static char last_sent;
+    int hx = -1, hy = -1, x, y, d, tries, pass, ddx, ddy, nx, ny;
+    char ch;
+
+    if (pending_dir) { /* answer the 'o' direction prompt */
+        d = pending_dir;
+        pending_dir = 0;
+        last_sent = nh3ds_dirkey[d];
+        return nh3ds_dirkey[d];
+    }
+    for (y = 0; y < ROWNO; ++y)
+        for (x = 0; x < COLNO; ++x)
+            if (nh3ds_map[y][x].gflags & MG_HERO)
+                hx = x, hy = y;
+    if (hx < 0) {
+        static boolean logged;
+
+        if (!logged) {
+            logged = TRUE;
+            nh3ds_log("[walk] no MG_HERO cell in the map buffer");
+        }
+        return '.'; /* no hero seen yet: rest */
+    }
+    if (nh3ds_mapunder[hy][hx].c == '>') {
+        last_sent = '>';
+        return '>'; /* standing on the stairs: descend */
+    }
+    if (nh3ds_mapunder[hy][hx].c == '%'
+        && !(last_sent == 'e' && hx == last_eat_x && hy == last_eat_y)) {
+        /* standing on food or a corpse: graze.  Only one 'e' per cell:
+         * if it produced no turn (the pack eat menu gets cancelled in
+         * demo mode) do not spam the prompt -- walk off instead; the
+         * stale '%' under-glyph corrects itself as soon as this cell
+         * is redrawn without the hero on it */
+        last_eat_x = hx, last_eat_y = hy;
+        last_sent = 'e';
+        return 'e';
+    }
+    ++step;
+    /* failure feedback: if the hero did not move since the last call
+     * and a move key was sent, that way is blocked in the real game
+     * despite looking open in the buffer (iron bars, webs, a fighting
+     * pet...) -- rotate the heading so the next momentum tries start
+     * elsewhere instead of bumping forever */
+    if (hx == last_hx && hy == last_hy && last_sent
+        && !strchr(".>eos", last_sent))
+        dir = (dir + 1) & 7;
+    last_hx = hx, last_hy = hy;
+    if (step % 5 == 0) {
+        last_sent = '.';
+        return '.'; /* pause: lets dumps catch the hero standing on
+                     * items or stairs (under-the-hero layer) */
+    }
+    /* steer toward what it can see -- one greedy step per call, no
+     * pathfinding: food first when a hunger message scrolled by
+     * (starvation ends every run otherwise), then the down stairs */
+    if (nh3ds_demo_hungry
+        && (d = nh3ds_demo_step_toward('%', hx, hy)) != 0) {
+        last_sent = (char) d;
+        return d;
+    }
+    if ((d = nh3ds_demo_step_toward('>', hx, hy)) != 0) {
+        last_sent = (char) d;
+        return d;
+    }
+    /* every 9th step: head for the nearest visible closed door and
+     * open it once adjacent */
+    if (step % 9 == 0) {
+        int bx = -1, by = -1;
+
+        for (y = 0; y < ROWNO; ++y)
+            for (x = 0; x < COLNO; ++x)
+                if (nh3ds_map[y][x].c == '+'
+                    && (bx < 0
+                        || abs(x - hx) + abs(y - hy)
+                           < abs(bx - hx) + abs(by - hy)))
+                    bx = x, by = y;
+        if (bx >= 0) {
+            ddx = bx - hx, ddy = by - hy;
+            if (abs(ddx) <= 1 && abs(ddy) <= 1 && (ddx || ddy)) {
+                for (d = 0; d < 8; ++d)
+                    if (nh3ds_dx8[d] == ddx && nh3ds_dy8[d] == ddy)
+                        break;
+                pending_dir = d & 7;
+                last_sent = 'o';
+                return 'o';
+            }
+            if (abs(ddx) >= abs(ddy) && ddx) {
+                nx = hx + ((ddx > 0) ? 1 : -1);
+                if (nx >= 0 && nx < COLNO
+                    && nh3ds_is_open(&nh3ds_map[hy][nx])) {
+                    d = (ddx > 0) ? 1 : 0;
+                    dir = d;
+                    last_sent = nh3ds_dirkey[d];
+                    return nh3ds_dirkey[d];
+                }
+            }
+            if (ddy) {
+                ny = hy + ((ddy > 0) ? 1 : -1);
+                if (ny >= 0 && ny < ROWNO
+                    && nh3ds_is_open(&nh3ds_map[ny][hx])) {
+                    d = (ddy > 0) ? 3 : 2;
+                    dir = d;
+                    last_sent = nh3ds_dirkey[d];
+                    return nh3ds_dirkey[d];
+                }
+            }
+        }
+    }
+    /* explore with momentum -- keep heading one way until blocked,
+     * then take the next open direction; prefer quiet seen cells
+     * (not letters = not monsters or the pet), then fights, and only
+     * push into unseen cells (dark corridors) when nothing seen is
+     * open -- a push into real rock bumps harmlessly and the failure
+     * feedback above rotates away */
+    for (pass = 0; pass < 3; ++pass) {
+        for (tries = 0; tries < 8; ++tries) {
+            d = (dir + tries) & 7;
+            if (hx + nh3ds_dx8[d] >= 0 && hx + nh3ds_dx8[d] < COLNO
+                && hy + nh3ds_dy8[d] >= 0 && hy + nh3ds_dy8[d] < ROWNO) {
+                const struct nh3ds_cell *cp =
+                    &nh3ds_map[hy + nh3ds_dy8[d]][hx + nh3ds_dx8[d]];
+
+                if (!nh3ds_is_open(cp))
+                    continue;
+                ch = cp->c;
+                if (pass == 0
+                    && (ch == '\0' || (ch >= 'a' && ch <= 'z')
+                        || (ch >= 'A' && ch <= 'Z')))
+                    continue; /* unseen or a monster: later pass */
+                if (pass == 1
+                    && (ch == '\0' || !((ch >= 'a' && ch <= 'z')
+                                        || (ch >= 'A' && ch <= 'Z'))))
+                    continue; /* not a seen monster */
+                if (pass == 2 && ch != '\0')
+                    continue; /* seen: handled by earlier passes */
+                dir = d;
+                last_sent = nh3ds_dirkey[d];
+                return nh3ds_dirkey[d];
+            }
+        }
+    }
+    {
+        static int last_bx = -1, last_by = -1;
+
+        if (hx != last_bx || hy != last_by) {
+            last_bx = hx, last_by = hy;
+            nh3ds_log("[walk] boxed in at (%d,%d), no door seen -- search",
+                      hx, hy);
+        }
+    }
+    last_sent = 's';
+    return 's'; /* boxed in with no door: search (secret doors) */
+}
+
+/* 3ddebug sweep mode ("M" in the flag file): once the hero exists,
+ * magic-map the level, enter farlook and sweep the look cursor across
+ * it (the viewport follows the cursor; no turns pass while the cursor
+ * moves, so nothing starves), then leave farlook and let the chase
+ * walk the hero to the now-mapped '>'.  Restarts on every level
+ * change.  Deliberately dumb: a hardcoded 'h'/'l' sequence, no
+ * heuristics. */
+static int
+nh3ds_demo_sweep(void)
+{
+    static int phase;
+    static unsigned long gen = ~0ul;
+    static int swept;
+    int hx = -1, x, y;
+
+    for (y = 0; y < ROWNO; ++y)
+        for (x = 0; x < COLNO; ++x)
+            if (nh3ds_map[y][x].gflags & MG_HERO)
+                hx = x;
+    if (hx < 0)
+        return '.'; /* not in the game yet: rest until the hero exists */
+
+    if (nh3ds_mapgen != gen) { /* fresh level: start over */
+        gen = nh3ds_mapgen;
+        phase = 0;
+        swept = 0;
+    }
+    switch (phase) {
+    case 0:
+        ++phase;
+        return 0x06; /* ^F: magic mapping (debug mode) */
+    case 1:
+        ++phase;
+        return ';'; /* farlook: enter the getpos cursor mode */
+    case 2:
+    case 3:
+        ++phase;
+        return ' '; /* get through the farlook info prompts */
+    case 4:
+        if (swept++ < 100)
+            return 'h'; /* 100 steps left... */
+        if (swept++ < 300)
+            return 'l'; /* ...then 200 right (clamps at the edge) */
+        ++phase;
+        /* fall through */
+    case 5:
+        phase = 0; /* leave farlook and restart the sweep: no chase
+                    * afterwards, unattended runs stay in cursor mode
+                    * and keep producing fresh sweep dumps */
+        return 0x1B;
+    default:
+        return '.';
+    }
+}
+
+/* the 3ddebug autopilot dispatcher */
+static int
+nh3ds_demo_walk(void)
+{
+    if (nh3ds_debug_sweep)
+        return nh3ds_demo_sweep();
+    return nh3ds_demo_chase();
+}
+
 /* blocking read used by both input events */
 static int
 nh3ds_read_key(void)
@@ -1112,14 +2026,34 @@ nh3ds_read_key(void)
 
     for (;;) {
         key = nh3ds_next_key();
-        if (key)
+        if (key) {
+            /* TEMP trace: pin down the kick direction-prompt input
+             * loss; every real key the game receives, one log line */
+            nh3ds_log("[key] '%c' (0x%02x) moves=%ld",
+                      (key >= 32 && key < 127) ? key : '?',
+                      (unsigned) key, svm.moves);
             return key;
+        }
         /* demo mode: nobody has ever touched the controls, keep the
          * game moving with the forced no-op rest ('m' prefix + '.');
          * once any button is seen, real input takes over for good */
         if (!nh3ds_any_button_ever) {
-            nh3ds_demo_toggle = !nh3ds_demo_toggle;
-            return nh3ds_demo_toggle ? '.' : 'm';
+            int k;
+
+            if (nh3ds_debug3d) {
+                k = nh3ds_demo_walk(); /* wander + take stairs */
+            } else {
+                nh3ds_demo_toggle = !nh3ds_demo_toggle;
+                k = nh3ds_demo_toggle ? '.' : 'm';
+            }
+            {
+                static unsigned long dk_n;
+
+                if ((++dk_n & 63) == 0)
+                    nh3ds_log("[demo key n=%lu] '%c' moves=%ld",
+                              dk_n, (char) k, svm.moves);
+            }
+            return k;
         }
     }
 }
@@ -1146,7 +2080,6 @@ static void
 nh3ds_menu_render(int cursor)
 {
     int rows = 26;
-    int i, row, top;
 
     if (cursor >= 0) {
         if (cursor < nh3ds_menu.top)
@@ -1154,32 +2087,10 @@ nh3ds_menu_render(int cursor)
         if (cursor >= nh3ds_menu.top + rows)
             nh3ds_menu.top = cursor - rows + 1;
     }
-    top = nh3ds_menu.top;
+    nh3ds_menu.cursor = cursor;
+    nh3ds_view = NH3DS_VM_MENU;
+    nh3ds_render_frame();
 
-    nh3ds_scr(1);
-    printf("\x1b[2J\x1b[0m");
-    printf("\x1b[1;1H\x1b[37;1m%-50.50s", nh3ds_menu.prompt);
-    for (row = 0, i = top; i < nh3ds_menu.n && row < rows; ++i, ++row) {
-        const struct nh3ds_menuitem *m = &nh3ds_menu.item[i];
-        char line[128];
-        const char *tag = "  ";
-
-        if (nh3ds_menu_selectable(i)) {
-            tag = (cursor == i) ? "> " : "  ";
-            if (m->itemflags & MENU_ITEMFLAGS_SELECTED)
-                tag = "* ";
-        }
-        if (m->ch && m->ch != ' ')
-            (void) sprintf(line, "%s%c) %s", tag, m->ch, m->str);
-        else
-            (void) sprintf(line, "%s%s", tag, m->str);
-        if (nh3ds_menu_selectable(i))
-            printf("\x1b[%d;1H\x1b[0m%-47.47s", row + 2, line);
-        else
-            printf("\x1b[%d;1H\x1b[36;1m%-47.47s", row + 2, line);
-    }
-    printf("\x1b[%d;1H\x1b[36m%-50.50s", TOP_ROWS - 1,
-           "pad=move A=ok B=cancel letter=select");
     if (cursor < 0) {
         nh3ds_scr(0);
         printf("\x1b[2J\x1b[0m\x1b[29;1H\x1b[0m%-40.40s", "[A] continue");
@@ -1317,8 +2228,22 @@ nh3ds_menu_pick(int how, MENU_ITEM_P **menulist)
             } else {
                 break; /* START: done, keep toggles */
             }
+        } else if (down & KEY_X) {
+            /* grab: in a multi-select menu ("Things that are here")
+             * take everything selectable and confirm; PICK_ONE acts
+             * like A (take the cursor item) */
+            if (how == PICK_ONE) {
+                nh3ds_menu.item[cursor].itemflags |=
+                    MENU_ITEMFLAGS_SELECTED;
+            } else {
+                for (i = 0; i < nh3ds_menu.n; ++i)
+                    if (nh3ds_menu_selectable(i))
+                        nh3ds_menu.item[i].itemflags |=
+                            MENU_ITEMFLAGS_SELECTED;
+            }
+            done = TRUE;
         }
-        /* SELECT/Y/X: ignored for now */
+        /* SELECT/Y: ignored for now */
         if (done)
             break;
     }
@@ -1367,8 +2292,6 @@ nh3ds_prefix_ci(const char *txt, const char *pre, int plen)
     return TRUE;
 }
 
-#define NH3DS_EXTMAX 128
-
 /* the ext-command menu, tty "#cmd" style: the available commands are
  * listed on the top screen and filtered live by the letters typed on
  * the bottom-screen touch keyboard (pad = move, A = run it, B =
@@ -1379,99 +2302,97 @@ nh3ds_prefix_ci(const char *txt, const char *pre, int plen)
 static int
 nh3ds_ext_menu(void)
 {
-    /* available commands as extcmdlist[] indices */
-    int idx[NH3DS_EXTMAX];
     const struct ext_func_tab *efp;
-    char filter[24];
-    int n = 0, flen = 0, mtop = 0, cursor = 0, i;
+    int n = 0, i;
 
     for (efp = extcmdlist; efp->ef_txt && n < NH3DS_EXTMAX; ++efp) {
         if ((efp->flags & (CMD_NOT_AVAILABLE | INTERNALCMD))
             || !(efp->flags & AUTOCOMPLETE)
             || (!wizard && (efp->flags & WIZMODECMD)))
             continue;
-        idx[n++] = (int) (efp - extcmdlist);
+        nh3ds_ext.idx[n++] = (int) (efp - extcmdlist);
     }
     if (!n)
         return -1;
-    filter[0] = '\0';
+    nh3ds_ext.n = n;
+    nh3ds_ext.filter[0] = '\0';
+    nh3ds_ext.flen = 0;
+    nh3ds_ext.mtop = 0;
+    nh3ds_ext.cursor = 0;
     nh3ds_keys_open = FALSE; /* the menu owns the bottom screen now */
     if (nh3ds_ext_prefill) { /* F:force verb button queued a filter */
-        (void) strncpy(filter, nh3ds_ext_prefill, sizeof filter - 1);
-        filter[sizeof filter - 1] = '\0';
-        flen = (int) strlen(filter);
+        (void) strncpy(nh3ds_ext.filter, nh3ds_ext_prefill,
+                       sizeof nh3ds_ext.filter - 1);
+        nh3ds_ext.filter[sizeof nh3ds_ext.filter - 1] = '\0';
+        nh3ds_ext.flen = (int) strlen(nh3ds_ext.filter);
         nh3ds_ext_prefill = 0;
     }
 
     for (;;) {
-        int match[NH3DS_EXTMAX];
-        int nm = 0;
         boolean filter_changed = FALSE;
         u32 down;
         int tcol, trow;
 
-        for (i = 0; i < n; ++i)
-            if (!flen
-                || nh3ds_prefix_ci(extcmdlist[idx[i]].ef_txt, filter, flen))
-                match[nm++] = idx[i];
+        /* recompute the match list for the current prefix filter */
+        nh3ds_ext.nm = 0;
+        for (i = 0; i < nh3ds_ext.n; ++i)
+            if (!nh3ds_ext.flen
+                || nh3ds_prefix_ci(extcmdlist[nh3ds_ext.idx[i]].ef_txt,
+                                   nh3ds_ext.filter, nh3ds_ext.flen))
+                nh3ds_ext.match[nh3ds_ext.nm++] = nh3ds_ext.idx[i];
 
         if (filter_changed) { /* new filter: jump to the first match */
-            cursor = 0;
-            mtop = 0;
+            nh3ds_ext.cursor = 0;
+            nh3ds_ext.mtop = 0;
         }
         /* clamp the cursor into the current match list */
-        if (cursor >= nm)
-            cursor = nm - 1;
-        if (cursor < 0)
-            cursor = 0;
-        if (mtop > cursor)
-            mtop = cursor;
-        if (mtop > nm - 1)
-            mtop = nm - 1;
-        if (mtop < 0)
-            mtop = 0;
-        nh3ds_scr(1);
-        printf("\x1b[2J\x1b[0m");
-        printf("\x1b[1;1H\x1b[37;1m#%.22s_\x1b[0m", filter);
-        for (i = mtop; i < nm && i < mtop + 26; ++i) {
-            const struct ext_func_tab *ef = &extcmdlist[match[i]];
+        if (nh3ds_ext.cursor >= nh3ds_ext.nm)
+            nh3ds_ext.cursor = nh3ds_ext.nm - 1;
+        if (nh3ds_ext.cursor < 0)
+            nh3ds_ext.cursor = 0;
+        if (nh3ds_ext.mtop > nh3ds_ext.cursor)
+            nh3ds_ext.mtop = nh3ds_ext.cursor;
+        if (nh3ds_ext.mtop > nh3ds_ext.nm - 1)
+            nh3ds_ext.mtop = nh3ds_ext.nm - 1;
+        if (nh3ds_ext.mtop < 0)
+            nh3ds_ext.mtop = 0;
 
-            printf("\x1b[%d;1H\x1b[0m%s%-14.14s %.32s", i - mtop + 2,
-                   (i == cursor) ? "> " : "  ", ef->ef_txt,
-                   ef->ef_desc ? ef->ef_desc : "");
-        }
-        if (!nm)
-            printf("\x1b[2;1H\x1b[31m  (no matching command)");
-        printf("\x1b[%d;1H\x1b[36m%-50.50s", TOP_ROWS,
-               "A=do B=bsp START=cancel pad=move");
+        nh3ds_view = NH3DS_VM_EXT;
+        nh3ds_render_frame();
 
         /* bottom screen: description of the highlighted command over
          * the letter keyboard */
         nh3ds_scr(0);
         printf("\x1b[2J\x1b[0m");
-        nh3ds_detail(nm ? (extcmdlist[match[cursor]].ef_desc
-                           ? extcmdlist[match[cursor]].ef_desc
-                           : extcmdlist[match[cursor]].ef_txt)
-                        : "no matching command");
+        nh3ds_detail(nh3ds_ext.nm
+                         ? (extcmdlist[nh3ds_ext.match[nh3ds_ext.cursor]]
+                                .ef_desc
+                            ? extcmdlist[nh3ds_ext.match[nh3ds_ext.cursor]]
+                                  .ef_desc
+                            : extcmdlist[nh3ds_ext.match[nh3ds_ext.cursor]]
+                                  .ef_txt)
+                         : "no matching command");
         nh3ds_kbd_render();
 
         down = nh3ds_menu_input(&tcol, &trow);
         if (tcol >= 0) {
             int ch = nh3ds_kbd_map(tcol, trow);
 
-            if (ch && flen < (int) sizeof filter - 1) {
-                filter[flen++] = nh3ds_lower((char) ch);
+            if (ch
+                && nh3ds_ext.flen < (int) sizeof nh3ds_ext.filter - 1) {
+                nh3ds_ext.filter[nh3ds_ext.flen++] =
+                    nh3ds_lower((char) ch);
                 filter_changed = TRUE;
             }
         } else if (down & KEY_DUP) {
-            if (cursor > 0)
-                --cursor;
+            if (nh3ds_ext.cursor > 0)
+                --nh3ds_ext.cursor;
         } else if (down & KEY_DDOWN) {
-            if (cursor < nm - 1)
-                ++cursor;
+            if (nh3ds_ext.cursor < nh3ds_ext.nm - 1)
+                ++nh3ds_ext.cursor;
         } else if (down & KEY_B) {
-            if (flen) {
-                filter[--flen] = '\0';
+            if (nh3ds_ext.flen) {
+                nh3ds_ext.filter[--nh3ds_ext.flen] = '\0';
                 filter_changed = TRUE;
             } else {
                 return -1;
@@ -1479,9 +2400,9 @@ nh3ds_ext_menu(void)
         } else if (down & KEY_START) {
             return -1;
         } else if (down & KEY_A) {
-            if (nm) {
+            if (nh3ds_ext.nm) {
                 nh3ds_full_redraw();
-                return match[cursor];
+                return nh3ds_ext.match[nh3ds_ext.cursor];
             }
         }
     }
@@ -1575,7 +2496,11 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
         /* the shim windowport never sets this itself; without it
          * getlock() would take the raw getchar() path */
         iflags.window_inited = TRUE;
-        nh3ds_log("[init_nhwindows] window_inited=TRUE");
+        /* ask the core for background glyphs: the floor terrain beneath
+         * objects, monsters and the hero (the stereo floor plane and
+         * the terrain under the hero) */
+        iflags.use_background_glyph = TRUE;
+        nh3ds_log("[init_nhwindows] window_inited=TRUE bg_glyph=TRUE");
     } else if (!strcmp(name, "shim_player_selection")) {
         nh3ds_detect_player(180); /* 3s to press a button */
         if (nh3ds_any_button_ever) {
@@ -1637,6 +2562,10 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
 
         if (ty == NHW_MAP) {
             memset(nh3ds_map, 0, sizeof nh3ds_map);
+            memset(nh3ds_mapbg, 0, sizeof nh3ds_mapbg);
+            memset(nh3ds_mapunder, 0, sizeof nh3ds_mapunder);
+            nh3ds_cur_x = nh3ds_cur_y = -1;
+            ++nh3ds_mapgen;
             nh3ds_map_dirty = TRUE;
         }
     } else if (!strcmp(name, "shim_display_nhwindow")) {
@@ -1672,7 +2601,24 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
         if (w > 0 && w < NH3DS_MAXWINID)
             nh3ds_wintype[w] = 0;
     } else if (!strcmp(name, "shim_curs")) {
-        /* phase 2: position indicator; the hero glyph already shows */
+        /* position indicator: on the map this is the getpos cursor
+         * (farlook/travel targeting); the cube hides while it sits on
+         * the hero -- which is where curs() puts it after every move */
+        {
+            winid w = (winid) args[0].i;
+            int ty = (w > 0 && w < NH3DS_MAXWINID) ? nh3ds_wintype[w] - 1
+                                                   : -1;
+
+            if (ty == NHW_MAP) {
+                nh3ds_cur_x = (int) args[1].i;
+                nh3ds_cur_y = (int) args[2].i;
+                /* getpos moves the cursor without passing turns, so
+                 * refresh() (per-turn) will not fire: redraw now or
+                 * the cursor cube is invisible while it moves */
+                nh3ds_map_dirty = TRUE;
+                nh3ds_render_frame();
+            }
+        }
     } else if (!strcmp(name, "shim_putstr")) {
         winid w = (winid) args[0].i;
         const char *str = args[2].s ? args[2].s : "";
@@ -1790,13 +2736,51 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
     } else if (!strcmp(name, "shim_print_glyph")) {
         coordxy x = (coordxy) args[1].i;
         coordxy y = (coordxy) args[2].i;
-        const glyph_info *gi = (const glyph_info *) args[3].p;
+        const glyph_info *gip = (const glyph_info *) args[3].p;
+        const glyph_info *bgip = (const glyph_info *) args[4].p;
+        struct nh3ds_cell *cell, *bg, *un;
+        signed char clr;
 
-        if (x >= 0 && x < COLNO && y >= 0 && y < ROWNO && gi) {
-            nh3ds_map[y][x].c = (char) gi->ttychar;
-            nh3ds_map[y][x].color =
-                (signed char) (gi->gm.sym.color <= 0 ? -1
-                                                     : gi->gm.sym.color);
+        if (x >= 0 && x < COLNO && y >= 0 && y < ROWNO && gip) {
+            cell = &nh3ds_map[y][x];
+            bg = &nh3ds_mapbg[y][x];
+            un = &nh3ds_mapunder[y][x];
+            clr = (signed char) (gip->gm.sym.color <= 0 ? -1
+                                                        : gip->gm.sym.color);
+            /* keep the last non-hero foreground glyph per cell: on the
+             * hero's tile it is what the hero stands on */
+            if (!(gip->gm.glyphflags & MG_HERO)) {
+                un->c = (char) gip->ttychar;
+                un->color = clr;
+                un->glyph = gip->glyph;
+                un->gflags = gip->gm.glyphflags;
+            }
+            cell->c = (char) gip->ttychar;
+            cell->color = clr;
+            cell->glyph = gip->glyph;
+            cell->gflags = gip->gm.glyphflags;
+            {
+                static unsigned long pg_n;
+                static uchar pg_seen[256];
+
+                ++pg_n;
+                if (!pg_seen[(uchar) gip->ttychar & 0xff]) {
+                    pg_seen[(uchar) gip->ttychar & 0xff] = 1;
+                    nh3ds_log("[pg first n=%lu] '%c' (%d) glyph=%ld color=%d",
+                              pg_n, (char) gip->ttychar,
+                              (int) gip->ttychar, (long) gip->glyph,
+                              (int) clr);
+                }
+                if ((pg_n & 8191) == 0)
+                    nh3ds_log("[pg count] %lu", pg_n);
+            }
+            if (bgip) {
+                bg->c = (char) bgip->ttychar;
+                bg->color = (signed char) (bgip->gm.sym.color <= 0
+                                               ? -1 : bgip->gm.sym.color);
+                bg->glyph = bgip->glyph;
+                bg->gflags = bgip->gm.glyphflags;
+            }
             nh3ds_map_dirty = TRUE;
         }
     } else if (!strcmp(name, "shim_raw_print")
@@ -1839,6 +2823,8 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
         if (!nh3ds_any_button_ever) {
             if (strstr(query, "Destroy old game"))
                 ans = 'y';
+            else if (strstr(query, "eat it?"))
+                ans = 'y'; /* demo heroes never shop, they graze */
             else
                 ans = def ? def : 'n';
             rint = ans;
@@ -2034,14 +3020,9 @@ nh3ds_cleanup(void)
 {
     nh3ds_dump_and_close();
     /* hold-on-exit screen: keep the exit reason visible until the user
-     * acknowledges it (the console is wiped on return to the launcher) */
-    nh3ds_scr(1);
-    printf("\x1b[0m\x1b[26;1H\x1b[K");
-    if (nh3ds_lastwords[0])
-        printf("\x1b[27;1H\x1b[31m%.180s\x1b[0m", nh3ds_lastwords);
-    printf("\x1b[29;1H\x1b[36mexit -- press START to return to the "
-           "launcher\x1b[0m");
-    (void) fflush(stdout);
+     * acknowledges it (the screen is wiped on return to the launcher) */
+    nh3ds_view = NH3DS_VM_EXIT;
+    nh3ds_render_frame();
     for (;;) {
         u32 kdown;
 
@@ -2050,6 +3031,10 @@ nh3ds_cleanup(void)
         if (kdown & (KEY_START | KEY_SELECT | KEY_A | KEY_B))
             break;
         svcSleepThread(50 * 1000 * 1000LL); /* 50 ms */
+    }
+    if (nh3ds_gpu_ok) {
+        C2D_Fini();
+        C3D_Fini();
     }
     gfxExit();
 }
@@ -2060,21 +3045,14 @@ main(int argc, char *argv[])
     char *nh_argv[2];
 
     gfxInitDefault();
-    /* Top screen 50x30, bottom 40x30 with the default 8x8 font.  The
-     * top screen is the game view; the bottom screen shows message
-     * history and (phase 2c) menus and the software keyboard. */
-    /* Separate PrintConsole structs: consoleInit(..., NULL) would hand
-     * back the same static default console for both screens, and the
-     * second init would retarget it to the bottom screen. */
-    nh3ds_top = consoleInit(GFX_TOP, &nh3ds_topcon);
+    /* The bottom screen keeps the libctru console (message history,
+     * touch verb grid, keyboards, menu detail pane); the top screen is
+     * a citro2d stereo viewport (see the depth section above). */
     nh3ds_bot = consoleInit(GFX_BOTTOM, &nh3ds_botcon);
+    nh3ds_gpu_init();
     nh3ds_st_init();
-    nh3ds_scr(1);
-    printf("\x1b[2J\x1b[0m");
-    nh3ds_draw_legend();
     nh3ds_scr(0);
     printf("\x1b[2J\x1b[0m\x1b[1;1HNetHack 3DS booting...\x1b[0m");
-    nh3ds_scr(1);
 
     if (chdir(nh3ds_hackdir) < 0) {
         printf("nh3ds: cannot chdir to %s\n", nh3ds_hackdir);
@@ -2084,8 +3062,30 @@ main(int argc, char *argv[])
     } else {
         nh3ds_trace = fopen("nh3ds.log", "w");
         if (nh3ds_trace)
-            nh3ds_log("[start] NetHack 3DS phase 2 (P2c+save), hackdir=%s",
+            nh3ds_log("[start] NetHack 3DS phase 4a (stereo map), hackdir=%s",
                       nh3ds_hackdir);
+        /* debug aid: force the 3D slider, dump both eyes as BMPs into
+         * a ring, and let demo mode hunt the down-stairs; a file
+         * starting with 'L' also pins the hero to the levitation
+         * plane for a visual test of that layer */
+        nh3ds_debug3d = (access("3drig", F_OK) == 0);
+        if (nh3ds_debug3d) {
+            FILE *f = fopen("3drig", "r");
+
+            if (f) {
+                char flagbuf[16];
+
+                if (fgets(flagbuf, (int) sizeof flagbuf, f)) {
+                    nh3ds_debug_lev = strchr(flagbuf, 'L') != NULL;
+                    nh3ds_debug_sweep = strchr(flagbuf, 'M') != NULL;
+                }
+                (void) fclose(f);
+            }
+            /* the rig runs in debug/wizard mode (magic mapping via ^F)
+             * without needing an OPTIONS=playmode:debug line in the
+             * config files -- those stay player-clean */
+            wizard = TRUE;
+        }
         /* CHDIR is disabled in the SHIM_GRAPHICS configuration, so
          * check_recordfile() never runs; create the variable files. */
         nh3ds_ensure_file("record");
@@ -2105,11 +3105,13 @@ main(int argc, char *argv[])
     (void) argc;
     (void) argv;
 
+    /* first frame: legend over the empty map, so the top screen is
+     * never showing an uninitialized framebuffer */
+    nh3ds_render_frame();
+
     shim_graphics_set_callback(shim_cb);
     (void) nhmain(1, nh_argv); /* moveloop() only returns at game over */
 
-    nh3ds_scr(1);
-    printf("NetHack 3DS: game over.\n");
     nh3ds_log("[game over] nhmain returned");
     return 0;
 }

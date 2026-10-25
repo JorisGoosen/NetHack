@@ -393,9 +393,16 @@ P3  UX polish: bottom-screen menus w/ touch, message history browsing, key
     remapping, options via defaults.nh, status hilites/colors, ~50-col
     viewport tuning (consider 800px wide mode or 6x8 font for 66-100 cols).
 
-P4  Graphics: citro2d tile renderer (win/share tile data), then the fun one --
-    stereoscopic depth: render map layers (floor / items / monsters / walls)
-    at different parallax planes for a diorama effect using the 3D slider.
+P4  DONE 2026-10-24: top screen fully citro2d with the fun one -- a
+    stereoscopic depth map ("diorama"): the level renders as parallax
+    layers driven by the 3D slider (walls/UI at the glass, entities
+    behind, furniture raised, a dedicated under-the-hero layer, floors
+    deeper, stairs-down deepest, levitating heroes lifted).  Glyphs
+    come from the 8x8 console font via a GPU texture atlas; colors
+    from the game's own glyph map.  Verified with a debug rig (forced
+    slider + per-eye BMP dumps matched against the font).  Bottom
+    screen unchanged (libctru console: menus, touch, swkbd, message
+    tail).
 
 P5  (optional) .cia packaging (makerom+bannertool), upstream pull request to
     NetHack/NetHack -- the ifdef-isolated cross-pre/post + sys/3ds additions
@@ -418,6 +425,49 @@ save ("save/1Wizard" written, alock.* cleaned) -> restore ("Hello Wizard,
 ... welcome back", resumed turn) -> death (jackal) -> tombstone -> topten
 -> clean exit. Sizes: NetHack3ds.3dsx 3,921,508 B; elf 6,136,632 B (with
 symbols); nh5013ds.zip 2,368,931 B.
+
+P4 status (2026-10-24, stereo map)
+----------------------------------
+* Top screen moved off the libctru console onto citro2d/citro3d: GPU
+  init/cleanup, a 256x64 RGBA8 glyph atlas built from libctru's
+  default_font_bin (the same 8x8 console font, Morton-swizzled for the
+  PICA texture layout), palette tints per stored glyph color, and a
+  layered stereo draw of the whole level buffer.  All top-screen
+  console output ported to citro2d text (messages, 2-row status,
+  legend footer, menus, ext-command list, exit screen); the libctru
+  console remains only on the bottom screen.
+* Depth planes (px disparity at slider = 1.0, positive = behind the
+  glass), nh3ds_depth[]: WALL/UI 0, LEV 2, ENTITY 4, FURNITURE 6,
+  UNDER 8, FLOOR 10, DOWN 13; per-eye shift = eye * depth * slider *
+  0.5.  Painter order DOWN -> FLOOR -> UNDER -> FURNITURE -> ENTITY ->
+  LEV -> WALL, alpha blended.
+* Layer classification (nh3ds_glyph_layer): walls/doors/trees/bars/
+  lavawall/closed drawbridges -> WALL; altar/grave/throne/sink/
+  fountain/webs/stairs+ladders up -> FURNITURE; stairs+ladders down/
+  pits/holes/trapdoors -> DOWN; room/corr/ice/air/cloud/pool/water/
+  lava/S_ndoor/open drawbridges -> FLOOR; objects/monsters/swallow/
+  explosion/warning -> ENTITY.  Hero = ENTITY, or LEV when levitating
+  or flying (BL_MASK_LEV/BL_MASK_FLY).
+* print_glyph's bkglyphinfo (previously ignored) now feeds a background
+  terrain plane, enabled via iflags.use_background_glyph in
+  init_nhwindows; the hero's cell keeps the last non-hero glyph in an
+  "under" buffer rendered between ENTITY and FURNITURE so what the
+  hero stands on stays visible underneath it.
+* Debug rig, gated by a `3drig` file in the playground: forces the
+  slider to 1.0, ring-dumps both eye framebuffers as BMPs every 64
+  refreshes (32 slots, dump3d_NN_L/R.bmp), pins the hero to the LEV
+  plane when the file starts with 'L', and runs a deliberately dumb
+  autopilot (random momentum walk; opens doors when walled in,
+  searches when doorless, descends when standing on '>') so unattended
+  runs exercise the depth layers.  Walker instrumentation: [walk] and
+  [demo key] lines in nh3ds.log.
+* Verified in Azahar via the eye dumps + numpy font matching against
+  the extracted font: walls at plane 0, entities +4px, floors +10px,
+  stairs-up raised (FURNITURE), hero pinned to LEV via the flag, UI
+  text identical in both eyes (plane 0); parallax direction correct.
+  Colors match the game's glyph map -- notably the yellow '<' on
+  Dlvl 1 is the branch exit stair (S_brupstair, CLR_YELLOW by
+  definition), not a renderer bug.
 
 Risks / open questions
 ----------------------
@@ -458,9 +508,9 @@ Still open:
 * getmsghistory() still returns empty (restore works via putmsghistory
   replay).
 * Touch input for menus, message-history browsing, key remapping,
-  defaults.nh options (P3); tiles/stereo (P4); .cia (P5).
-* 8x8 console font = 50 map columns: viewport scroll solves it; revisit font
-  in P3/P4.
+  defaults.nh options (P3); .cia (P5).
+* 8x8 console font = 50 map columns: viewport scroll solves it; the
+  same font now also feeds the P4 GPU glyph atlas.
 * No fork/exec/threads needed by the game (moveloop is single-threaded) --
   matches 3DS fine. delay_output -> svcSleep.
 
