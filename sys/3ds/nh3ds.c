@@ -2185,6 +2185,21 @@ nh3ds_menu_selectable(int i)
     return nh3ds_menu.item[i].id.a_void != 0;
 }
 
+/* land the cursor on a selectable item at or before i (walk back, then
+ * forward from the top if item 0 is a heading); menus always have at
+ * least one selectable item -- nh3ds_menu_pick() bails out otherwise --
+ * so the forward walk terminates and the cursor never rests on a
+ * heading, which A/X would otherwise toggle into the selection */
+static int
+nh3ds_menu_seek(int i)
+{
+    while (i > 0 && !nh3ds_menu_selectable(i))
+        --i;
+    while (i < nh3ds_menu.n - 1 && !nh3ds_menu_selectable(i))
+        ++i;
+    return i;
+}
+
 /* tty assigns keyboard accelerators itself to items that arrived
  * without one (the pickup menu passes ch = 0 for floor objects);
  * mirror its pool: 'a'..'z' then 'A'.. */
@@ -2249,26 +2264,26 @@ nh3ds_menu_input(int *tcol, int *trow)
     u32 down;
 
     *tcol = *trow = -1;
+    /* wait for everything (incl. touch) to be released ... */
     do {
-        do {
-            hidScanInput();
-            gspWaitForVBlank();
-        } while (hidKeysHeld() & NH3DS_MENUWAIT_MASK);
-        for (;;) {
-            int tc, tr;
+        hidScanInput();
+        gspWaitForVBlank();
+    } while (hidKeysHeld() & NH3DS_MENUWAIT_MASK);
+    /* ... then for a fresh press or tap */
+    for (;;) {
+        int tc, tr;
 
-            nh3ds_apt_check();
-            if (nh3ds_tap(&tc, &tr)) {
-                *tcol = tc;
-                *trow = tr;
-                nh3ds_any_button_ever = TRUE;
-                return 0; /* tap: caller reads *tcol / *trow */
-            }
-            down = hidKeysDown();
-            if (down)
-                break;
+        nh3ds_apt_check();
+        if (nh3ds_tap(&tc, &tr)) {
+            *tcol = tc;
+            *trow = tr;
+            nh3ds_any_button_ever = TRUE;
+            return 0; /* tap: caller reads *tcol / *trow */
         }
-    } while (0);
+        down = hidKeysDown();
+        if (down)
+            break;
+    }
     nh3ds_any_button_ever = TRUE;
     return down;
 }
@@ -2354,14 +2369,12 @@ nh3ds_menu_pick(int how, MENU_ITEM_P **menulist)
             cursor -= 26;
             if (cursor < 0)
                 cursor = 0;
-            while (cursor > 0 && !nh3ds_menu_selectable(cursor))
-                --cursor;
+            cursor = nh3ds_menu_seek(cursor);
         } else if (down & KEY_DRIGHT) {
             cursor += 26;
             if (cursor >= nh3ds_menu.n)
                 cursor = nh3ds_menu.n - 1;
-            while (cursor > 0 && !nh3ds_menu_selectable(cursor))
-                --cursor;
+            cursor = nh3ds_menu_seek(cursor);
         } else if (down & KEY_B) {
             if (how == PICK_ONE)
                 return -1; /* cancel */
@@ -2398,7 +2411,8 @@ nh3ds_menu_pick(int how, MENU_ITEM_P **menulist)
     }
     n = 0;
     for (i = 0; i < nh3ds_menu.n; ++i)
-        if (nh3ds_menu.item[i].itemflags & MENU_ITEMFLAGS_SELECTED)
+        if ((nh3ds_menu.item[i].itemflags & MENU_ITEMFLAGS_SELECTED)
+            && nh3ds_menu_selectable(i))
             ++n;
     if (n == 0)
         return 0;
@@ -2407,7 +2421,8 @@ nh3ds_menu_pick(int how, MENU_ITEM_P **menulist)
     out = (MENU_ITEM_P *) alloc((unsigned) n * sizeof *out);
     n = 0;
     for (i = 0; i < nh3ds_menu.n; ++i)
-        if (nh3ds_menu.item[i].itemflags & MENU_ITEMFLAGS_SELECTED) {
+        if ((nh3ds_menu.item[i].itemflags & MENU_ITEMFLAGS_SELECTED)
+            && nh3ds_menu_selectable(i)) {
             out[n].item = nh3ds_menu.item[i].id;
             out[n].count = -1L; /* "select all" (no count prompt yet) */
             out[n].itemflags = nh3ds_menu.item[i].itemflags;

@@ -1,10 +1,13 @@
 NetHack 5.0 for Nintendo 3DS -- Port Plan
 =========================================
 
-Status:   P0 + P1 + P2 MVP DONE 2026-10-24 (overnight build session): the
-          committed build cross-compiles, boots in Azahar, plays (movement,
-          menus, swkbd), saves/restores, dies to tombstone + topten, exits
-          cleanly. P3/P4/P5 pending; real hardware untested.
+Status:   P0 + P1 + P2 + P4 DONE (2026-10-24): the committed build
+          cross-compiles, boots in Azahar and on real hardware, plays
+          (movement, menus, swkbd, touch verbs + keyboard, stereoscopic
+          3D map), saves/restores, dies to tombstone + topten, exits
+          cleanly.  Handheld testing (2026-10-25) drove the playability
+          fixes.  P3 partly done (touch input is in; message history
+          browsing, key remapping, defaults.nh options open), P5 pending.
 Game:     NetHack 5.0.1 (VERSION_MAJOR 5, VERSION_MINOR 0, PATCHLEVEL 1)
 Branch:   `3ds`
 Host:     Arch Linux x86-64 (cross toolchain), authoring possible on any host
@@ -390,9 +393,11 @@ P2  DONE 2026-10-24 (commits 5294dab31, 69ca9b585, 4fabae251, 62c283943):
     play session is the remaining bit (the 3drig rig autopilot plays
     itself meanwhile).
 
-P3  UX polish: bottom-screen menus w/ touch, message history browsing, key
-    remapping, options via defaults.nh, status hilites/colors, ~50-col
-    viewport tuning (consider 800px wide mode or 6x8 font for 66-100 cols).
+P3  UX polish (partly done): touch menus, touch verb buttons and the
+    letter keyboard are in (2026-10-25); still open: message history
+    browsing, key remapping, options via defaults.nh, status
+    hilites/colors, ~50-col viewport tuning (consider 800px wide mode or
+    6x8 font for 66-100 cols).
 
 P4  DONE 2026-10-24: top screen fully citro2d with the fun one -- a
     stereoscopic depth map ("diorama"): the level renders as parallax
@@ -503,8 +508,8 @@ Resolved by P1/P2 (overnight build):
 
 Still open:
 
-* Real hardware via 3dslink untested (Azahar only so far); bottom-screen
-  redraw cost on device unknown.
+* Real hardware: playable (handheld testing, 2026-10-25, drove the
+  playability fixes); unattended rig runs stay on Azahar.
 * swkbd fallback for yn prompts with long response sets (buttons cover
   current cases).
 * getmsghistory() still returns empty (restore works via putmsghistory

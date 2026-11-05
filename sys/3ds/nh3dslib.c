@@ -99,7 +99,6 @@ fcntl(int fd, int cmd, ...)
     switch (cmd) {
     case F_SETLK:
     case F_SETLKW:
-    case F_UNLCK:
         return 0;
     default:
         return -1;
