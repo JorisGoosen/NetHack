@@ -9,42 +9,36 @@
  * implemented here.  This file owns the 3DS: console rendering, hid input,
  * the software keyboard, and the process lifecycle.
  *
- * Phase 2c: menus and text entry.  add_menu streams are buffered per
- * window; select_menu renders them on the bottom screen (d-pad navigate,
- * A select/toggle, B cancel, START confirm; PICK_NONE lists wait for a
+ * Menus and text entry: add_menu streams are buffered per window;
+ * select_menu renders them on the bottom screen (d-pad navigate, A
+ * select/toggle, B cancel, START confirm; PICK_NONE lists wait for a
  * key like a tty).  getlin/askname use the libctru software keyboard;
  * #commands run through the core's own extcmd menu.  Character creation
  * uses the core's generic setup menus once a button press is seen.
  *
- * Phase 2b: hid input.  D-pad/circle-pad = hjkl (two held = diagonals,
- * L/R+direction = run), A='.' rest, B='i', X=',', Y='s', START='S',
- * SELECT='?'; yn prompts answer via buttons (B = no/esc, A = default).
- * The 3drig rig file (see sys/3ds/README.3ds) switches the front-end
- * to an unattended mode: canned name, auto-answered prompts,
- * auto-cancelled menus, so emulator runs progress without a player.
+ * Input: d-pad/circle-pad = hjkl (two held = diagonals, L+direction =
+ * run, R+direction = travel), A='.' rest, B='i', X=',', Y='s',
+ * START='S', SELECT='?'; yn prompts answer via buttons (B = no/esc,
+ * A = default); touch brings up verb buttons and a letter keyboard on
+ * the bottom screen.
  *
- * Phase 2a: console rendering.  The top screen (50x30 with the 8x8 font)
- * shows the message area (3 rows), the map viewport (21 rows x 50 cols,
- * horizontally scrolled via cliparound), a field-driven 2-row status bar
- * fed by status_update events, and a key legend.  The bottom screen (40x30)
- * shows the message-history tail, or the contents of a blocking menu/text
- * window while the game waits for a key.
- *
- * Phase 4a: stereoscopic depth.  The top screen is now a citro2d stereo
- * viewport (the bottom screen keeps the console).  Map glyphs are drawn
- * as sprites from an atlas of the same 8x8 console font (white pixels
- * on transparent) on depth layers: wall tops on the screen plane,
- * entities (hero, monsters, objects) on an intermediate plane, floor
- * terrain deepest, with stairs down / pits below the floor plane and
- * stairs up raised above it.  Each layer's horizontal parallax scales
- * with the 3D slider (at 0 the picture collapses to the old flat text
- * view; only the left eye is drawn then).  Levitation or flight raises
- * the hero one plane; the last thing the hero's tile showed before the
- * hero glyph covered it (plus the terrain the core reports beneath the
- * hero via the background glyph) is drawn on its own layer just above
- * the floor.  A "3drig" file in the playground forces the slider to
- * 1.0, dumps both eyes as BMPs every 64 frames and runs the
- * wander-and-take-stairs autopilot.
+ * Rendering: the top screen (50x30 with the 8x8 font) shows the message
+ * area (3 rows), the map viewport (21 rows x 50 cols, horizontally
+ * scrolled via cliparound), a field-driven 2-row status bar fed by
+ * status_update events, and a key legend.  The bottom screen (40x30)
+ * shows the message-history tail, or the contents of a blocking menu/
+ * text window while the game waits for a key.  The top screen is a
+ * citro2d stereo viewport: map glyphs are drawn as sprites from an
+ * atlas of the same 8x8 console font (white pixels on transparent) on
+ * depth layers -- wall tops on the screen plane, entities (hero,
+ * monsters, objects) on an intermediate plane, floor terrain deepest,
+ * with stairs down / pits below the floor plane and stairs up raised
+ * above it.  Each layer's horizontal parallax scales with the 3D
+ * slider (at 0 the picture collapses to the flat text view; only the
+ * left eye is drawn then).  Levitation or flight raises the hero one
+ * plane; the last thing the hero's tile showed before the hero glyph
+ * covered it (plus the terrain the core reports beneath the hero via
+ * the background glyph) is drawn on its own layer just above the floor.
  *
  * Build:  make CROSS_TO_3DS=1 all        (see sys/unix/hints/include/
  *         make CROSS_TO_3DS=1 3dspkg      cross-pre2.501 for the flags)
@@ -78,15 +72,13 @@ extern void shim_graphics_set_callback(shim_callback_t cb);
  * SHIM_GRAPHICS configuration has no CHDIR (include/config.h) */
 static const char *nh3ds_hackdir = "sdmc:/3ds/nethack";
 
-/* canned name for unattended rig runs (a role name would pre-select
- * that role in the core's name parsing) */
+/* fallback name when the software keyboard is cancelled (a role name
+ * would pre-select that role in the core's name parsing) */
 static const char *nh3ds_plname = "Adventurer";
 
 /* ----------------------------------------------------------------------*/
-/* trace log                                                              */
+/* hold-on-exit error capture                                             */
 /* ----------------------------------------------------------------------*/
-
-static FILE *nh3ds_trace;
 
 /* first raw_print/error we saw, shown on the hold-on-exit screen -- on
  * real hardware the console is wiped the instant we return to the
@@ -95,77 +87,6 @@ static char nh3ds_lastwords[192] = "";
 /* hand-set reasons (chdir hint, atlas failure) are sticky: the
  * raw_print feed must not replace them with a less specific message */
 static boolean nh3ds_lastwords_sticky;
-
-static void
-nh3ds_log(const char *fmt, ...)
-{
-    va_list ap;
-
-    if (!nh3ds_trace)
-        return;
-    va_start(ap, fmt);
-    (void) vfprintf(nh3ds_trace, fmt, ap);
-    va_end(ap);
-    (void) fputc('\n', nh3ds_trace);
-    (void) fflush(nh3ds_trace);
-}
-
-/* event accounting: log each event name the first time it is seen and
- * keep counters for the final dump */
-#define NHEV_MAX 48
-static struct {
-    const char *name;
-    unsigned long n;
-} nhev[NHEV_MAX];
-static int nhev_n;
-static unsigned long nhev_total;
-
-static void
-nhev_count(const char *name)
-{
-    int i;
-
-    ++nhev_total;
-    for (i = 0; i < nhev_n; ++i)
-        if (!strcmp(nhev[i].name, name)) {
-            ++nhev[i].n;
-            return;
-        }
-    if (nhev_n < NHEV_MAX) {
-        nhev[nhev_n].name = name;
-        nhev[nhev_n].n = 1;
-        ++nhev_n;
-    }
-    nh3ds_log("[evt first] %s", name);
-}
-
-/* periodic histogram so that a run killed from outside (pkill) still
- * leaves an audit trail; the final dump only happens on clean exit */
-static void
-nhev_periodic(void)
-{
-    int i;
-
-    if (nhev_total % 1048576L != 0)
-        return;
-    nh3ds_log("[evt snapshot total=%lu]", nhev_total);
-    for (i = 0; i < nhev_n; ++i)
-        nh3ds_log("[evt n=%8lu] %s", nhev[i].n, nhev[i].name);
-}
-
-static void
-nh3ds_dump_and_close(void)
-{
-    int i;
-
-    if (!nh3ds_trace)
-        return;
-    nh3ds_log("[exit] total shim events=%lu", nhev_total);
-    for (i = 0; i < nhev_n; ++i)
-        nh3ds_log("[evt n=%8lu] %s", nhev[i].n, nhev[i].name);
-    (void) fclose(nh3ds_trace);
-    nh3ds_trace = (FILE *) 0;
-}
 
 /* ----------------------------------------------------------------------*/
 /* screen geometry and render state                                       */
@@ -212,8 +133,6 @@ static coordxy nh3ds_vx, nh3ds_vy; /* viewport origin (top-left cell) */
 static int nh3ds_cur_x = -1, nh3ds_cur_y = -1; /* map cursor (getpos:
                                                 * farlook/travel); the
                                                 * cube hides on the hero */
-static unsigned long nh3ds_mapgen; /* bumped by map clears (level
-                                    * changes): the sweep restarts */
 
 /* ----------------------------------------------------------------------*/
 /* stereoscopic depth rendering (P4a)                                     */
@@ -259,12 +178,6 @@ static int nh3ds_view = NH3DS_VM_GAME;
 static boolean nh3ds_gpu_ok;
 static C3D_RenderTarget *nh3ds_rt_left, *nh3ds_rt_right;
 static boolean nh3ds_stereo;     /* whether gfxSet3D is currently on */
-static boolean nh3ds_debug3d;    /* "3drig" flag file seen at boot */
-static boolean nh3ds_debug_lev;  /* ...containing 'L': hero always on
-                                  * the levitation plane (visual test) */
-static boolean nh3ds_debug_sweep; /* ...containing 'M': magic-map +
-                                   * farlook cursor-sweep autopilot */
-static unsigned long nh3ds_frame_n;
 
 /* glyph atlas: the libctru console font (8x8, 1bpp, 256 chars -- the
  * same font the old console view used) expanded to white pixels on
@@ -589,8 +502,6 @@ static int
 nh3ds_cell_layer(const struct nh3ds_cell *cell)
 {
     if (cell->gflags & MG_HERO) {
-        if (nh3ds_debug_lev)
-            return NH3DS_D_LEV; /* visual test of the levitation plane */
         return (nh3ds_st_cond & (BL_MASK_LEV | BL_MASK_FLY))
                    ? NH3DS_D_LEV : NH3DS_D_ENTITY;
     }
@@ -721,13 +632,6 @@ nh3ds_draw_messages(void)
  * width (40) so long messages stay readable on both screens instead of
  * being truncated */
 
-/* shared by the 3ddebug walker helpers below */
-static const char nh3ds_dirkey[] = "hjklyubn";
-static const int nh3ds_dx8[8] = { -1, 1, 0, 0, -1, 1, -1, 1 };
-static const int nh3ds_dy8[8] = { 0, 0, -1, 1, -1, -1, 1, 1 };
-/* set/cleared by the message handler as hunger messages scroll by */
-static boolean nh3ds_demo_hungry;
-
 static void
 nh3ds_msg_add(const char *s)
 {
@@ -738,13 +642,6 @@ nh3ds_msg_add(const char *s)
         s = "";
     (void) strncpy(buf, s, NH3DS_MSGLEN - 1);
     buf[NH3DS_MSGLEN - 1] = '\0';
-    /* the 3ddebug walker grazes on this: hunger messages scroll by
-     * wrapped, but nh3ds_msg_add sees each full line once */
-    if (strstr(buf, "feel hungry") || strstr(buf, "feel weak")
-        || strstr(buf, "faint"))
-        nh3ds_demo_hungry = TRUE;
-    else if (strstr(buf, "no longer hungry"))
-        nh3ds_demo_hungry = FALSE;
     p = buf;
     while (*p) {
         char chunk[BOT_COLS + 1];
@@ -863,16 +760,6 @@ nh3ds_draw_status(void)
         BL_LEVELDESC, BL_STR, BL_DX, BL_CO, BL_IN, BL_WI, BL_CH,
         BL_TIME, BL_HUNGER, BL_WEAPON, BL_ARMOR, BL_TERRAIN,
     };
-    static unsigned long nh3ds_st_draw_n;
-    int i;
-
-    ++nh3ds_st_draw_n;
-    if (nh3ds_st_draw_n % 4096 == 0) {
-        for (i = 0; i < MAXBLSTATS; ++i)
-            if (nh3ds_st_val[i][0])
-                nh3ds_log("[st draw#%lu fld=%d] '%s'", nh3ds_st_draw_n, i,
-                          nh3ds_st_val[i]);
-    }
 
     nh3ds_st_row(0, row1flds, (int) (sizeof row1flds / sizeof row1flds[0]),
                  FALSE);
@@ -1001,69 +888,12 @@ nh3ds_draw_view(float eye, float slider)
     }
 }
 
-/* debug: write both eyes' top-screen framebuffers as 400x240 BMPs into
- * a 32-slot ring (enabled by a "3drig" file in the playground) */
-static void
-nh3ds_debug_dump(void)
-{
-    static const char *const eye[2] = { "L", "R" };
-    gfx3dSide_t sides[2] = { GFX_LEFT, GFX_RIGHT };
-    char fn[24];
-    int i;
-
-    gspWaitForPPF(); /* wait for the display transfer into the LCD fb */
-    for (i = 0; i < 2; ++i) {
-        u8 *fb = (u8 *) gfxGetFramebuffer(GFX_TOP, sides[i], NULL, NULL);
-        u8 hdr[54], row[400 * 3];
-        u32 sz = 54u + 400u * 240u * 3u;
-        FILE *f;
-        int sx, sy;
-
-        if (!fb)
-            continue;
-        (void) snprintf(fn, sizeof fn, "dump3d_%02lu_%s.bmp",
-                        (unsigned long) (nh3ds_frame_n / 64) % 32, eye[i]);
-        (void) memset(hdr, 0, sizeof hdr);
-        hdr[0] = 'B', hdr[1] = 'M';
-        hdr[2] = (u8) sz, hdr[3] = (u8) (sz >> 8);
-        hdr[4] = (u8) (sz >> 16), hdr[5] = (u8) (sz >> 24);
-        hdr[10] = 54;                /* pixel data offset */
-        hdr[14] = 40;                /* BITMAPINFOHEADER size */
-        hdr[18] = (u8) 400;          /* width, little-endian */
-        hdr[19] = (u8) (400 >> 8);
-        hdr[22] = (u8) 240;          /* height, little-endian */
-        hdr[23] = (u8) (240 >> 8);
-        hdr[26] = 1;                 /* planes */
-        hdr[28] = 24;                /* bits per pixel */
-        f = fopen(fn, "wb");
-        if (!f)
-            continue;
-        (void) fwrite(hdr, 1, sizeof hdr, f);
-        /* the framebuffer is 240x400, column-major with its origin at
-         * the screen's bottom-left: fb pixel p of column sx is screen
-         * row (239 - p); BMP rows are bottom-up (file row 0 = image
-         * bottom = screen bottom = framebuffer pixel 0), so ascending
-         * framebuffer rows land the image upright */
-        for (sy = 0; sy < 240; ++sy) {
-            for (sx = 0; sx < 400; ++sx) {
-                const u8 *px = fb + ((u32) sx * 240 + (u32) sy) * 3;
-
-                row[sx * 3] = px[0];
-                row[sx * 3 + 1] = px[1];
-                row[sx * 3 + 2] = px[2];
-            }
-            (void) fwrite(row, 1, sizeof row, f);
-        }
-        (void) fclose(f);
-    }
-}
-
 /* one citro3d frame: both eyes when the slider is up, else only the
  * left one (a flat picture) */
 static void
 nh3ds_frame_draw(void)
 {
-    float slider = nh3ds_debug3d ? 1.0f : (float) osGet3DSliderState();
+    float slider = (float) osGet3DSliderState();
     boolean stereo = slider > 0.001f;
 
     if (stereo != nh3ds_stereo) {
@@ -1093,9 +923,6 @@ nh3ds_render_frame(void)
     if (!nh3ds_gpu_ok)
         return;
     nh3ds_frame_draw();
-    ++nh3ds_frame_n;
-    if (nh3ds_debug3d && nh3ds_frame_n % 64 == 0)
-        nh3ds_debug_dump();
 }
 
 static void
@@ -1104,13 +931,10 @@ nh3ds_gpu_init(void)
     int i;
 
     nh3ds_gpu_ok = FALSE;
-    if (!C3D_Init(C3D_DEFAULT_CMDBUF_SIZE)) {
-        nh3ds_log("[gpu] C3D_Init failed");
+    if (!C3D_Init(C3D_DEFAULT_CMDBUF_SIZE))
         return;
-    }
     if (!C2D_Init(C2D_DEFAULT_MAX_OBJECTS)) {
         C3D_Fini();
-        nh3ds_log("[gpu] C2D_Init failed");
         return;
     }
     nh3ds_rt_left = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
@@ -1118,7 +942,6 @@ nh3ds_gpu_init(void)
     if (!nh3ds_rt_left || !nh3ds_rt_right) {
         C2D_Fini();
         C3D_Fini();
-        nh3ds_log("[gpu] screen target creation failed");
         return;
     }
     (void) C2D_SetTintMode(C2D_TintMult);
@@ -1135,7 +958,6 @@ nh3ds_gpu_init(void)
         (void) snprintf(nh3ds_lastwords, sizeof nh3ds_lastwords,
                         "glyph atlas init failed -- top screen off");
         nh3ds_lastwords_sticky = TRUE;
-        nh3ds_log("[gpu] atlas init failed");
         return;
     }
     gfxSet3D(FALSE);
@@ -1206,12 +1028,6 @@ nh3ds_draw_bot_msgs(void)
 /* the touch letter-keyboard overlay is open (it owns the taps) */
 static boolean nh3ds_keys_open;
 
-/* any button or tap since boot: once set, blocking displays wait for a
- * real press instead of auto-continuing after a few frames (the rig
- * relies on the auto-continue; a real player always touches something
- * during name entry and role setup first) */
-static boolean nh3ds_any_button_ever;
-
 /* aptMainLoop() turns FALSE when the system wants the process gone
  * (another applet taking over now; HOME handling for a future .cia).
  * The indefinite wait loops call this and leave through exit() so the
@@ -1219,20 +1035,16 @@ static boolean nh3ds_any_button_ever;
 static void
 nh3ds_apt_check(void)
 {
-    if (!aptMainLoop()) {
-        nh3ds_log("[apt] system requested exit");
+    if (!aptMainLoop())
         exit(EXIT_SUCCESS); /* atexit: nh3ds_cleanup */
-    }
 }
 
 /* wait for any button press (edge-triggered: must be released first);
- * returns the button bits, or 0 if it auto-continued because no
- * interaction has happened yet */
+ * returns the button bits */
 static u32
 nh3ds_wait_button(void)
 {
     u32 held;
-    int frames = 0;
 
     do {
         hidScanInput();
@@ -1244,17 +1056,8 @@ nh3ds_wait_button(void)
         hidScanInput();
         gspWaitForVBlank();
         held = hidKeysHeld();
-        if (held != 0) {
-            nh3ds_any_button_ever = TRUE;
+        if (held != 0)
             return held;
-        }
-        if (nh3ds_any_button_ever)
-            continue; /* a real player is present: wait indefinitely */
-        if (++frames >= 6)
-            return 0; /* no interaction yet: auto-continue (a page wait
-                       * would cost seconds of wall time per --More--
-                       * at the emulator's reduced speed; the rig
-                       * depends on this) */
     }
 }
 
@@ -1269,19 +1072,6 @@ nh3ds_ensure_file(const char *fn)
 
     if (f)
         (void) fclose(f);
-}
-
-static const char *
-nh3ds_wintypename(int type)
-{
-    switch (type) {
-    case NHW_MESSAGE: return "MESSAGE";
-    case NHW_STATUS:  return "STATUS";
-    case NHW_MAP:     return "MAP";
-    case NHW_MENU:    return "MENU";
-    case NHW_TEXT:    return "TEXT";
-    default:          return "?";
-    }
 }
 
 /* refresh any dirty region; called once per turn before returning input */
@@ -1361,7 +1151,6 @@ nh3ds_display_file(const char *fname, boolean complain)
     if (!fp) {
         if (complain)
             pline("Cannot open %s.", fname);
-        nh3ds_log("[display_file] cannot open %s", fname);
         return;
     }
     nh3ds_keys_open = FALSE; /* the popup owns the bottom now */
@@ -1690,7 +1479,7 @@ nh3ds_overlay_map(int cx, int cy)
 /* hid input (phase 2b)                                                   */
 /* ----------------------------------------------------------------------*/
 
-/* Button mapping (sys/3ds/PLAN.md "UI design"):
+/* Button mapping (the bottom-screen legend mirrors this):
  *   d-pad / circle pad  hjkl (two held = diagonals yubn)
  *   L+dir = run (HJKL/YUBN); L alone = shift for the touch keyboard
  *   R+dir = 'g' + dir travel (move until something interesting)
@@ -1714,7 +1503,7 @@ nh3ds_next_key(void) /* 0 = nothing to report this frame */
     /* depth control without a keypress: re-render once when the 3D
      * slider moves (the usual per-turn redraw would wait for a move) */
     {
-        float slider = nh3ds_debug3d ? 1.0f : (float) osGet3DSliderState();
+        float slider = (float) osGet3DSliderState();
 
         if (last_slider < 0.0f)
             last_slider = slider;
@@ -1754,7 +1543,6 @@ nh3ds_next_key(void) /* 0 = nothing to report this frame */
             last_key = 'g';
             last_mask = held;
             frames_since = 0;
-            nh3ds_any_button_ever = TRUE;
             return 'g'; /* travel: move until something interesting; the
                          * direction follows while R stays held */
         }
@@ -1797,7 +1585,6 @@ nh3ds_next_key(void) /* 0 = nothing to report this frame */
                 int ch = nh3ds_overlay_map(tcol, trow);
 
                 if (ch) {
-                    nh3ds_any_button_ever = TRUE;
                     last_key = 0;
                     last_mask = 0;
                     frames_since = 0;
@@ -1821,7 +1608,6 @@ nh3ds_next_key(void) /* 0 = nothing to report this frame */
             if (vi >= 0) {
                 const struct nh3ds_verb *v = &nh3ds_verbs[vi];
 
-                nh3ds_any_button_ever = TRUE;
                 last_key = 0;
                 last_mask = 0;
                 frames_since = 0;
@@ -1848,298 +1634,7 @@ nh3ds_next_key(void) /* 0 = nothing to report this frame */
     last_key = key;
     last_mask = held;
     frames_since = 0;
-    nh3ds_any_button_ever = TRUE;
     return key;
-}
-
-/* walkable for the 3ddebug autopilot: unseen cells ('\0' -- dark
- * corridors do NOT reveal ahead, so the only way to traverse them is
- * stepping into the unseen; a step that turns out to be real rock
- * bumps harmlessly and the walker's failure feedback rotates away),
- * floor-ish glyphs, and open doors (which share their '|'/'-' ttychars
- * with walls, so tell them apart by the stored cmap glyph).  Walls,
- * closed doors, iron bars and solid rock need 'o' or a way around.
- * (strchr(" |-+", '\0') would wrongly report a match on the string
- * terminator.) */
-static boolean
-nh3ds_is_open(const struct nh3ds_cell *cp)
-{
-    if (cp->c == '\0')
-        return TRUE; /* unseen: try it, bump-and-rotate if rock */
-    if (glyph_is_cmap(cp->glyph)) {
-        int cmap = glyph_to_cmap(cp->glyph);
-
-        if (cmap == S_hodoor || cmap == S_vodoor)
-            return TRUE; /* open door: walk through */
-        if (cmap == S_bars)
-            return FALSE; /* iron bars share '#' with corridors */
-    }
-    return !strchr(" |-+", cp->c);
-}
-
-/* one greedy step toward the nearest seen cell whose glyph char is
- * `want` (dominant axis first, the other axis when blocked); returns
- * the move key, or 0 when there is no such cell or no open way to it */
-static int
-nh3ds_demo_step_toward(char want, int hx, int hy)
-{
-    int tx = -1, ty = -1, x, y, dx, dy, nx, ny;
-
-    for (y = 0; y < ROWNO; ++y)
-        for (x = 0; x < COLNO; ++x)
-            if (nh3ds_map[y][x].c == want
-                && (tx < 0
-                    || abs(x - hx) + abs(y - hy)
-                       < abs(tx - hx) + abs(ty - hy)))
-                tx = x, ty = y;
-    if (tx < 0)
-        return 0;
-    dx = tx - hx, dy = ty - hy;
-    if (abs(dx) >= abs(dy) && dx) {
-        nx = hx + ((dx > 0) ? 1 : -1);
-        if (nx >= 0 && nx < COLNO && nh3ds_is_open(&nh3ds_map[hy][nx]))
-            return (dx > 0) ? 'l' : 'h';
-    }
-    if (dy) {
-        ny = hy + ((dy > 0) ? 1 : -1);
-        if (ny >= 0 && ny < ROWNO && nh3ds_is_open(&nh3ds_map[ny][hx]))
-            return (dy > 0) ? 'j' : 'k';
-    }
-    return 0;
-}
-
-/* 3ddebug autopilot: wander randomly (momentum -- keep one heading
- * until blocked, then the next open direction), rest every 5th step,
- * every 9th step head for the nearest visible closed door and open it
- * once adjacent (rooms are inescapable for a random walker otherwise),
- * search when stuck in a doorless nook, and descend when standing on
- * '>'.  Deliberately dumb -- it only needs to steer the hero past
- * enough terrain to exercise the depth layers in unattended emulator
- * runs; real mapping and pathing live in the nethack MCP tooling, not
- * in the front-end. */
-static int
-nh3ds_demo_chase(void)
-{
-    static int step, dir = 1, pending_dir;
-    static int last_hx = -1, last_hy = -1;
-    static int last_eat_x = -1, last_eat_y = -1;
-    static char last_sent;
-    int hx = -1, hy = -1, x, y, d, tries, pass, ddx, ddy, nx, ny;
-    char ch;
-
-    if (pending_dir) { /* answer the 'o' direction prompt */
-        d = pending_dir;
-        pending_dir = 0;
-        last_sent = nh3ds_dirkey[d];
-        return nh3ds_dirkey[d];
-    }
-    for (y = 0; y < ROWNO; ++y)
-        for (x = 0; x < COLNO; ++x)
-            if (nh3ds_map[y][x].gflags & MG_HERO)
-                hx = x, hy = y;
-    if (hx < 0) {
-        static boolean logged;
-
-        if (!logged) {
-            logged = TRUE;
-            nh3ds_log("[walk] no MG_HERO cell in the map buffer");
-        }
-        return '.'; /* no hero seen yet: rest */
-    }
-    if (nh3ds_mapunder[hy][hx].c == '>') {
-        last_sent = '>';
-        return '>'; /* standing on the stairs: descend */
-    }
-    if (nh3ds_mapunder[hy][hx].c == '%'
-        && !(last_sent == 'e' && hx == last_eat_x && hy == last_eat_y)) {
-        /* standing on food or a corpse: graze.  Only one 'e' per cell:
-         * if it produced no turn (the pack eat menu gets cancelled in
-         * demo mode) do not spam the prompt -- walk off instead; the
-         * stale '%' under-glyph corrects itself as soon as this cell
-         * is redrawn without the hero on it */
-        last_eat_x = hx, last_eat_y = hy;
-        last_sent = 'e';
-        return 'e';
-    }
-    ++step;
-    /* failure feedback: if the hero did not move since the last call
-     * and a move key was sent, that way is blocked in the real game
-     * despite looking open in the buffer (iron bars, webs, a fighting
-     * pet...) -- rotate the heading so the next momentum tries start
-     * elsewhere instead of bumping forever */
-    if (hx == last_hx && hy == last_hy && last_sent
-        && !strchr(".>eos", last_sent))
-        dir = (dir + 1) & 7;
-    last_hx = hx, last_hy = hy;
-    if (step % 5 == 0) {
-        last_sent = '.';
-        return '.'; /* pause: lets dumps catch the hero standing on
-                     * items or stairs (under-the-hero layer) */
-    }
-    /* steer toward what it can see -- one greedy step per call, no
-     * pathfinding: food first when a hunger message scrolled by
-     * (starvation ends every run otherwise), then the down stairs */
-    if (nh3ds_demo_hungry
-        && (d = nh3ds_demo_step_toward('%', hx, hy)) != 0) {
-        last_sent = (char) d;
-        return d;
-    }
-    if ((d = nh3ds_demo_step_toward('>', hx, hy)) != 0) {
-        last_sent = (char) d;
-        return d;
-    }
-    /* every 9th step: head for the nearest visible closed door and
-     * open it once adjacent */
-    if (step % 9 == 0) {
-        int bx = -1, by = -1;
-
-        for (y = 0; y < ROWNO; ++y)
-            for (x = 0; x < COLNO; ++x)
-                if (nh3ds_map[y][x].c == '+'
-                    && (bx < 0
-                        || abs(x - hx) + abs(y - hy)
-                           < abs(bx - hx) + abs(by - hy)))
-                    bx = x, by = y;
-        if (bx >= 0) {
-            ddx = bx - hx, ddy = by - hy;
-            if (abs(ddx) <= 1 && abs(ddy) <= 1 && (ddx || ddy)) {
-                for (d = 0; d < 8; ++d)
-                    if (nh3ds_dx8[d] == ddx && nh3ds_dy8[d] == ddy)
-                        break;
-                pending_dir = d & 7;
-                last_sent = 'o';
-                return 'o';
-            }
-            if (abs(ddx) >= abs(ddy) && ddx) {
-                nx = hx + ((ddx > 0) ? 1 : -1);
-                if (nx >= 0 && nx < COLNO
-                    && nh3ds_is_open(&nh3ds_map[hy][nx])) {
-                    d = (ddx > 0) ? 1 : 0;
-                    dir = d;
-                    last_sent = nh3ds_dirkey[d];
-                    return nh3ds_dirkey[d];
-                }
-            }
-            if (ddy) {
-                ny = hy + ((ddy > 0) ? 1 : -1);
-                if (ny >= 0 && ny < ROWNO
-                    && nh3ds_is_open(&nh3ds_map[ny][hx])) {
-                    d = (ddy > 0) ? 3 : 2;
-                    dir = d;
-                    last_sent = nh3ds_dirkey[d];
-                    return nh3ds_dirkey[d];
-                }
-            }
-        }
-    }
-    /* explore with momentum -- keep heading one way until blocked,
-     * then take the next open direction; prefer quiet seen cells
-     * (not letters = not monsters or the pet), then fights, and only
-     * push into unseen cells (dark corridors) when nothing seen is
-     * open -- a push into real rock bumps harmlessly and the failure
-     * feedback above rotates away */
-    for (pass = 0; pass < 3; ++pass) {
-        for (tries = 0; tries < 8; ++tries) {
-            d = (dir + tries) & 7;
-            if (hx + nh3ds_dx8[d] >= 0 && hx + nh3ds_dx8[d] < COLNO
-                && hy + nh3ds_dy8[d] >= 0 && hy + nh3ds_dy8[d] < ROWNO) {
-                const struct nh3ds_cell *cp =
-                    &nh3ds_map[hy + nh3ds_dy8[d]][hx + nh3ds_dx8[d]];
-
-                if (!nh3ds_is_open(cp))
-                    continue;
-                ch = cp->c;
-                if (pass == 0
-                    && (ch == '\0' || (ch >= 'a' && ch <= 'z')
-                        || (ch >= 'A' && ch <= 'Z')))
-                    continue; /* unseen or a monster: later pass */
-                if (pass == 1
-                    && (ch == '\0' || !((ch >= 'a' && ch <= 'z')
-                                        || (ch >= 'A' && ch <= 'Z'))))
-                    continue; /* not a seen monster */
-                if (pass == 2 && ch != '\0')
-                    continue; /* seen: handled by earlier passes */
-                dir = d;
-                last_sent = nh3ds_dirkey[d];
-                return nh3ds_dirkey[d];
-            }
-        }
-    }
-    {
-        static int last_bx = -1, last_by = -1;
-
-        if (hx != last_bx || hy != last_by) {
-            last_bx = hx, last_by = hy;
-            nh3ds_log("[walk] boxed in at (%d,%d), no door seen -- search",
-                      hx, hy);
-        }
-    }
-    last_sent = 's';
-    return 's'; /* boxed in with no door: search (secret doors) */
-}
-
-/* 3ddebug sweep mode ("M" in the flag file): once the hero exists,
- * magic-map the level, enter farlook and sweep the look cursor across
- * it (the viewport follows the cursor; no turns pass while the cursor
- * moves, so nothing starves), then leave farlook and let the chase
- * walk the hero to the now-mapped '>'.  Restarts on every level
- * change.  Deliberately dumb: a hardcoded 'h'/'l' sequence, no
- * heuristics. */
-static int
-nh3ds_demo_sweep(void)
-{
-    static int phase;
-    static unsigned long gen = ~0ul;
-    static int swept;
-    int hx = -1, x, y;
-
-    for (y = 0; y < ROWNO; ++y)
-        for (x = 0; x < COLNO; ++x)
-            if (nh3ds_map[y][x].gflags & MG_HERO)
-                hx = x;
-    if (hx < 0)
-        return '.'; /* not in the game yet: rest until the hero exists */
-
-    if (nh3ds_mapgen != gen) { /* fresh level: start over */
-        gen = nh3ds_mapgen;
-        phase = 0;
-        swept = 0;
-    }
-    switch (phase) {
-    case 0:
-        ++phase;
-        return 0x06; /* ^F: magic mapping (debug mode) */
-    case 1:
-        ++phase;
-        return ';'; /* farlook: enter the getpos cursor mode */
-    case 2:
-    case 3:
-        ++phase;
-        return ' '; /* get through the farlook info prompts */
-    case 4:
-        if (swept++ < 100)
-            return 'h'; /* 100 steps left... */
-        if (swept++ < 300)
-            return 'l'; /* ...then 200 right (clamps at the edge) */
-        ++phase;
-        /* fall through */
-    case 5:
-        phase = 0; /* leave farlook and restart the sweep: no chase
-                    * afterwards, unattended runs stay in cursor mode
-                    * and keep producing fresh sweep dumps */
-        return 0x1B;
-    default:
-        return '.';
-    }
-}
-
-/* the 3ddebug autopilot dispatcher */
-static int
-nh3ds_demo_walk(void)
-{
-    if (nh3ds_debug_sweep)
-        return nh3ds_demo_sweep();
-    return nh3ds_demo_chase();
 }
 
 /* blocking read used by both input events */
@@ -2153,20 +1648,6 @@ nh3ds_read_key(void)
         key = nh3ds_next_key();
         if (key)
             return key;
-        /* the debug rig's autopilot keeps unattended rig runs moving;
-         * without the rig file the game simply waits for a real
-         * player -- no autopilot, ever */
-        if (!nh3ds_any_button_ever && nh3ds_debug3d) {
-            int k = nh3ds_demo_walk();
-            {
-                static unsigned long dk_n;
-
-                if ((++dk_n & 63) == 0)
-                    nh3ds_log("[demo key n=%lu] '%c' moves=%ld",
-                              dk_n, (char) k, svm.moves);
-            }
-            return k;
-        }
     }
 }
 
@@ -2277,14 +1758,12 @@ nh3ds_menu_input(int *tcol, int *trow)
         if (nh3ds_tap(&tc, &tr)) {
             *tcol = tc;
             *trow = tr;
-            nh3ds_any_button_ever = TRUE;
             return 0; /* tap: caller reads *tcol / *trow */
         }
         down = hidKeysDown();
         if (down)
             break;
     }
-    nh3ds_any_button_ever = TRUE;
     return down;
 }
 
@@ -2613,9 +2092,6 @@ union shimarg {
     const char *s;
 };
 
-static unsigned long nh3ds_getch_n;
-static unsigned long nh3ds_poskey_n;
-
 static void
 shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
 {
@@ -2626,9 +2102,6 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
     void *rptr = (void *) 0;
     va_list ap;
     int i;
-
-    nhev_count(name);
-    nhev_periodic();
 
     va_start(ap, fmt);
     for (i = 1; fmt[i] && argn < SHIM_MAXARGS; ++i) {
@@ -2649,43 +2122,24 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
          * objects, monsters and the hero (the stereo floor plane and
          * the terrain under the hero) */
         iflags.use_background_glyph = TRUE;
-        nh3ds_log("[init_nhwindows] window_inited=TRUE bg_glyph=TRUE");
     } else if (!strcmp(name, "shim_player_selection")) {
-        if (nh3ds_debug3d) {
-            /* rig: unattended -- role_init() randomizes unspecified
-             * facets */
-            nh3ds_log("[player_selection] rig: role/race/gend/align random");
-        } else {
-            /* generic role/race/gender/alignment menus (the core's
-             * genl setup drives this windowport's own menus) */
-            (void) genl_player_setup(80);
-            nh3ds_log("[player_selection] genl setup done");
-        }
+        /* generic role/race/gender/alignment menus (the core's
+         * genl setup drives this windowport's own menus) */
+        (void) genl_player_setup(80);
     } else if (!strcmp(name, "shim_player_selection_or_tty")) {
         rint = 0; /* FALSE: don't run the generic tty-style setup */
     } else if (!strcmp(name, "shim_askname")) {
-        if (nh3ds_debug3d) {
-            /* rig: canned name, unattended */
+        if (!nh3ds_swkbd("Who are you?", svp.plname, sizeof svp.plname)) {
             (void) strncpy(svp.plname, nh3ds_plname,
                            sizeof svp.plname - 1);
             svp.plname[sizeof svp.plname - 1] = '\0';
-            nh3ds_log("[askname] rig canned plname=\"%s\"", svp.plname);
-        } else if (nh3ds_swkbd("Who are you?", svp.plname,
-                               sizeof svp.plname)) {
-            nh3ds_log("[askname] swkbd plname=\"%s\"", svp.plname);
-        } else {
-            (void) strncpy(svp.plname, nh3ds_plname,
-                           sizeof svp.plname - 1);
-            svp.plname[sizeof svp.plname - 1] = '\0';
-            nh3ds_log("[askname] swkbd cancelled, using \"%s\"",
-                      svp.plname);
         }
     } else if (!strcmp(name, "shim_get_nh_event")) {
         /* phase 2b: poll hid here */
     } else if (!strcmp(name, "shim_exit_nhwindows")) {
-        nh3ds_log("[exit_nhwindows] %s", args[0].s ? args[0].s : "");
+        /* nothing */
     } else if (!strcmp(name, "shim_suspend_nhwindows")) {
-        nh3ds_log("[suspend_nhwindows] %s", args[0].s ? args[0].s : "");
+        /* nothing */
     } else if (!strcmp(name, "shim_resume_nhwindows")) {
         /* nothing */
     } else if (!strcmp(name, "shim_create_nhwindow")) {
@@ -2712,8 +2166,6 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
                 nh3ds_pop_n = 0;
                 nh3ds_pop_prompt[0] = '\0';
             }
-            nh3ds_log("[create_nhwindow] type=%s -> winid=%d",
-                      nh3ds_wintypename(type), (int) w);
         }
     } else if (!strcmp(name, "shim_clear_nhwindow")) {
         winid w = (winid) args[0].i;
@@ -2724,7 +2176,6 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
             memset(nh3ds_mapbg, 0, sizeof nh3ds_mapbg);
             memset(nh3ds_mapunder, 0, sizeof nh3ds_mapunder);
             nh3ds_cur_x = nh3ds_cur_y = -1;
-            ++nh3ds_mapgen;
             nh3ds_map_dirty = TRUE;
         }
     } else if (!strcmp(name, "shim_display_nhwindow")) {
@@ -2791,10 +2242,6 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
                     NH3DS_POPLINELEN - 1);
             nh3ds_pop_lines[nh3ds_pop_n][NH3DS_POPLINELEN - 1] = '\0';
             ++nh3ds_pop_n;
-        } else if ((ty == NHW_MENU || ty == NHW_TEXT)
-                   && w == nh3ds_pop_win) {
-            nh3ds_log("[putstr] popup full (%d lines), dropping \"%s\"",
-                      NH3DS_POPLINES, str);
         }
     } else if (!strcmp(name, "shim_display_file")) {
         nh3ds_display_file(args[0].s ? args[0].s : "", args[1].i != 0);
@@ -2817,26 +2264,20 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
         char ch = (char) args[3].i;
         const char *str = args[7].s ? args[7].s : "";
 
-        if (nh3ds_menu.active && w == nh3ds_menu.win) {
-            if (nh3ds_menu.n >= NH3DS_MAXMENU) {
-                nh3ds_log("[add_menu] full (%d), dropping \"%s\"",
-                          NH3DS_MAXMENU, str);
-            } else {
-                struct nh3ds_menuitem *m = &nh3ds_menu.item[nh3ds_menu.n];
+        if (nh3ds_menu.active && w == nh3ds_menu.win
+            && nh3ds_menu.n < NH3DS_MAXMENU) {
+            struct nh3ds_menuitem *m = &nh3ds_menu.item[nh3ds_menu.n];
 
-                m->id = *(const ANY_P *) (const void *) (uintptr_t)
-                            args[2].i;
-                m->ch = ch;
-                m->gch = (char) args[4].i;
-                m->attr = args[5].i;
-                m->clr = args[6].i;
-                (void) strncpy(m->str, str, sizeof m->str - 1);
-                m->str[sizeof m->str - 1] = '\0';
-                if (strlen(str) >= sizeof m->str)
-                    nh3ds_log("[add_menu] item clipped: \"%s\"", str);
-                m->itemflags = (unsigned) args[8].i;
-                ++nh3ds_menu.n;
-            }
+            m->id = *(const ANY_P *) (const void *) (uintptr_t)
+                        args[2].i;
+            m->ch = ch;
+            m->gch = (char) args[4].i;
+            m->attr = args[5].i;
+            m->clr = args[6].i;
+            (void) strncpy(m->str, str, sizeof m->str - 1);
+            m->str[sizeof m->str - 1] = '\0';
+            m->itemflags = (unsigned) args[8].i;
+            ++nh3ds_menu.n;
         }
     } else if (!strcmp(name, "shim_end_menu")) {
         const char *prompt = args[1].s;
@@ -2859,25 +2300,16 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
         if (w != nh3ds_menu.win || !nh3ds_menu.active) {
             rint = -1; /* stale or unbuffered window: cancelled */
         } else if (how == PICK_NONE) {
-            /* display-only list: show it and wait for a key (tty-like);
-             * the rig dismisses it unattended */
-            if (!nh3ds_debug3d) {
-                nh3ds_menu_render(-1);
-                nh3ds_wait_button();
-                nh3ds_full_redraw();
-            }
+            /* display-only list: show it and wait for a key (tty-like) */
+            nh3ds_menu_render(-1);
+            nh3ds_wait_button();
+            nh3ds_full_redraw();
             nh3ds_menu.active = FALSE;
             rint = 0;
-        } else if (nh3ds_debug3d) {
-            /* rig: cancel every interactive menu so unattended runs
-             * keep flowing */
-            nh3ds_menu.active = FALSE;
-            rint = -1;
         } else {
             rint = nh3ds_menu_pick(how, (MENU_ITEM_P **) args[2].p);
             nh3ds_menu.active = FALSE;
             nh3ds_full_redraw(); /* the menu owned the top screen */
-            nh3ds_log("[select_menu win=%d how=%d] -> %d", w, how, rint);
         }
     } else if (!strcmp(name, "shim_message_menu")) {
         /* acknowledge the message (equivalent of pressing the key) */
@@ -2930,21 +2362,6 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
             cell->color = clr;
             cell->glyph = gip->glyph;
             cell->gflags = gip->gm.glyphflags;
-            {
-                static unsigned long pg_n;
-                static uchar pg_seen[256];
-
-                ++pg_n;
-                if (!pg_seen[(uchar) gip->ttychar & 0xff]) {
-                    pg_seen[(uchar) gip->ttychar & 0xff] = 1;
-                    nh3ds_log("[pg first n=%lu] '%c' (%d) glyph=%ld color=%d",
-                              pg_n, (char) gip->ttychar,
-                              (int) gip->ttychar, (long) gip->glyph,
-                              (int) clr);
-                }
-                if ((pg_n & 8191) == 0)
-                    nh3ds_log("[pg count] %lu", pg_n);
-            }
             if (bgip) {
                 bg->c = (char) bgip->ttychar;
                 bg->color = (signed char) (bgip->gm.sym.color <= 0
@@ -2960,7 +2377,6 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
          * (a raw printf would land at an arbitrary console position,
          * often off-screen) */
         nh3ds_msg_add(args[0].s ? args[0].s : "");
-        nh3ds_log("[raw_print] %s", args[0].s ? args[0].s : "");
         /* remember the last error for the hold-on-exit screen:
          * last-wins because panic() prints an "Oops..." prologue first
          * and the actual reason last (end.c); sticky hand-set reasons
@@ -2970,15 +2386,8 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
                             "%s", args[0].s);
     } else if (!strcmp(name, "shim_nhgetch")) {
         rint = nh3ds_read_key();
-        ++nh3ds_getch_n;
-        if (nh3ds_getch_n == 1 || nh3ds_getch_n % 2048 == 0)
-            nh3ds_log("[nhgetch n=%lu] '%c'", nh3ds_getch_n, (char) rint);
     } else if (!strcmp(name, "shim_nh_poskey")) {
         rint = nh3ds_read_key();
-        ++nh3ds_poskey_n;
-        if (nh3ds_poskey_n == 1 || nh3ds_poskey_n % 2048 == 0)
-            nh3ds_log("[nh_poskey n=%lu] moves=%ld '%c'", nh3ds_poskey_n,
-                      svm.moves, (char) rint);
         nh3ds_refresh();
     } else if (!strcmp(name, "shim_nhbell")) {
         /* nothing */
@@ -2990,143 +2399,116 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
         char def = (char) args[2].i;
         char ans = 0;
 
-        /* relaunch friendliness under the rig: a stale lock file from a
-         * killed run prompts "There is already a game in progress under
-         * your name.  Destroy old game?" -- answer yes automatically so
-         * unattended save/restore testing keeps working */
-        if (nh3ds_debug3d && (strstr(query, "Destroy old game")
-                              || strstr(query, "eat it?"))) {
-            rint = 'y'; /* rig heroes never shop, they graze */
-            nh3ds_log("[yn rig] %s -> 'y'", query);
-        } else {
-            /* real play: the query wraps in the detail pane, the touch
-             * keyboard answers with the exact choice letter, and the
-             * physical buttons shortcut the common cases (A = default,
-             * B = no/escape, Y = yes, X = quit-choice) */
-            nh3ds_keys_open = FALSE;
-            nh3ds_scr(0);
-            printf("\x1b[2J\x1b[0m");
-            nh3ds_detail(query);
-            nh3ds_kbd_render();
-            printf("\x1b[29;1H\x1b[36m%-40.40s",
-                   "A=yes B=no START=def tap=key");
-            for (;;) {
-                u32 down;
-                int tcol, trow;
+        /* real play: the query wraps in the detail pane, the touch
+         * keyboard answers with the exact choice letter, and the
+         * physical buttons shortcut the common cases (A = default,
+         * B = no/escape, Y = yes, X = quit-choice) */
+        nh3ds_keys_open = FALSE;
+        nh3ds_scr(0);
+        printf("\x1b[2J\x1b[0m");
+        nh3ds_detail(query);
+        nh3ds_kbd_render();
+        printf("\x1b[29;1H\x1b[36m%-40.40s",
+               "A=yes B=no START=def tap=key");
+        for (;;) {
+            u32 down;
+            int tcol, trow;
 
-                down = nh3ds_menu_input(&tcol, &trow);
-                if (tcol >= 0) {
-                    int ch = nh3ds_kbd_map(tcol, trow);
-                    char c;
+            down = nh3ds_menu_input(&tcol, &trow);
+            if (tcol >= 0) {
+                int ch = nh3ds_kbd_map(tcol, trow);
+                char c;
 
-                    if (!ch)
-                        continue;
-                    c = (char) ch;
-                    /* resp == NULL is the getdir() direction prompt:
-                     * any tapped char is offered to the core, which
-                     * validates it (help_dir on a bad one) */
-                    if (!resp || strchr(resp, c)) {
-                        ans = c;
-                        break;
-                    }
-                    c = nh3ds_lower(c); /* shifted tap -> choice letter */
-                    if (resp && strchr(resp, c)) {
-                        ans = c;
-                        break;
-                    }
-                } else if (!resp
-                           && (down & (KEY_DUP | KEY_DDOWN | KEY_DLEFT
-                                       | KEY_DRIGHT))) {
-                    /* direction prompt (no response set): the d-pad
-                     * answers directly with the direction char (same
-                     * map as the main input).  Gated on !resp: on a
-                     * yes/no or lettered prompt a direction char is an
-                     * invalid answer and the core flags "program in
-                     * disorder". */
-                    ans = (char) ((down & KEY_DUP)
-                                      ? ((down & KEY_DLEFT)
-                                             ? 'y'
-                                             : (down & KEY_DRIGHT) ? 'u'
-                                                                   : 'k')
-                                      : (down & KEY_DLEFT)
-                                          ? ((down & KEY_DRIGHT) ? 'b' : 'h')
-                                          : (down & KEY_DRIGHT) ? 'n' : 'j');
+                if (!ch)
+                    continue;
+                c = (char) ch;
+                /* resp == NULL is the getdir() direction prompt:
+                 * any tapped char is offered to the core, which
+                 * validates it (help_dir on a bad one) */
+                if (!resp || strchr(resp, c)) {
+                    ans = c;
                     break;
-                } else if (!resp && !strncmp(query, "Shall I pick", 12)
-                           && (down & (KEY_A | KEY_START | KEY_Y | KEY_B))) {
-                    /* the generic role-setup prompt ("Shall I pick a
-                     * role, race, ...? [ynaq]") arrives with resp NULL
-                     * like a direction prompt; here B must answer "no"
-                     * (pick via menus) because esc quits role selection
-                     * outright and the game would start with a random
-                     * role.  A/START/Y = yes (random pick + confirm). */
-                    ans = (down & KEY_B) ? 'n' : 'y';
+                }
+                c = nh3ds_lower(c); /* shifted tap -> choice letter */
+                if (resp && strchr(resp, c)) {
+                    ans = c;
                     break;
-                } else if (down & KEY_A) {
-                    /* yes/no prompts: A = yes (console convention);
-                     * otherwise the default or first choice */
-                    if (resp && strchr(resp, 'y'))
-                        ans = 'y';
-                    else
-                        ans = (def && resp && strchr(resp, def))
-                                  ? def
-                                  : (resp && *resp) ? *resp
-                                      : (resp ? 'y' : '.');
-                    break;
-                } else if (down & KEY_START) {
-                    /* START keeps the default-answer shortcut */
+                }
+            } else if (!resp
+                       && (down & (KEY_DUP | KEY_DDOWN | KEY_DLEFT
+                                   | KEY_DRIGHT))) {
+                /* direction prompt (no response set): the d-pad
+                 * answers directly with the direction char (same
+                 * map as the main input).  Gated on !resp: on a
+                 * yes/no or lettered prompt a direction char is an
+                 * invalid answer and the core flags "program in
+                 * disorder". */
+                ans = (char) ((down & KEY_DUP)
+                                  ? ((down & KEY_DLEFT)
+                                         ? 'y'
+                                         : (down & KEY_DRIGHT) ? 'u'
+                                                               : 'k')
+                                  : (down & KEY_DLEFT)
+                                      ? ((down & KEY_DRIGHT) ? 'b' : 'h')
+                                      : (down & KEY_DRIGHT) ? 'n' : 'j');
+                break;
+            } else if (!resp && !strncmp(query, "Shall I pick", 12)
+                       && (down & (KEY_A | KEY_START | KEY_Y | KEY_B))) {
+                /* the generic role-setup prompt ("Shall I pick a
+                 * role, race, ...? [ynaq]") arrives with resp NULL
+                 * like a direction prompt; here B must answer "no"
+                 * (pick via menus) because esc quits role selection
+                 * outright and the game would start with a random
+                 * role.  A/START/Y = yes (random pick + confirm). */
+                ans = (down & KEY_B) ? 'n' : 'y';
+                break;
+            } else if (down & KEY_A) {
+                /* yes/no prompts: A = yes (console convention);
+                 * otherwise the default or first choice */
+                if (resp && strchr(resp, 'y'))
+                    ans = 'y';
+                else
                     ans = (def && resp && strchr(resp, def))
                               ? def
                               : (resp && *resp) ? *resp
                                   : (resp ? 'y' : '.');
+                break;
+            } else if (down & KEY_START) {
+                /* START keeps the default-answer shortcut */
+                ans = (def && resp && strchr(resp, def))
+                          ? def
+                          : (resp && *resp) ? *resp
+                              : (resp ? 'y' : '.');
+                break;
+            } else if (down & KEY_B) {
+                ans = (resp && strchr(resp, 'n')) ? 'n' : '\033';
+                break;
+            } else if (down & KEY_Y) {
+                if (resp && strchr(resp, 'y')) {
+                    ans = 'y';
                     break;
-                } else if (down & KEY_B) {
-                    ans = (resp && strchr(resp, 'n')) ? 'n' : '\033';
+                }
+            } else if (down & KEY_X) {
+                if (resp && strchr(resp, 'q')) {
+                    ans = 'q';
                     break;
-                } else if (down & KEY_Y) {
-                    if (resp && strchr(resp, 'y')) {
-                        ans = 'y';
-                        break;
-                    }
-                } else if (down & KEY_X) {
-                    if (resp && strchr(resp, 'q')) {
-                        ans = 'q';
-                        break;
-                    }
                 }
             }
-            nh3ds_full_redraw();
-            rint = ans;
-            nh3ds_log("[yn buttons def='%c'] %s -> '%c'", def ? def : '?',
-                      query, ans);
         }
+        nh3ds_full_redraw();
+        rint = ans;
     } else if (!strcmp(name, "shim_getlin")) {
         const char *query = args[0].s ? args[0].s : "";
 
-        if (!nh3ds_debug3d) {
-            /* real play: software keyboard; ESC/cancel -> "\033" */
-            if (nh3ds_swkbd(query, (char *) args[1].p, BUFSZ))
-                nh3ds_log("[getlin] %s -> \"%s\"", query,
-                          (char *) args[1].p);
-            else {
-                strcpy((char *) args[1].p, "\033");
-                nh3ds_log("[getlin] %s -> ESC", query);
-            }
-        } else {
+        /* software keyboard; ESC/cancel -> "\033" */
+        if (!nh3ds_swkbd(query, (char *) args[1].p, BUFSZ))
             strcpy((char *) args[1].p, "\033");
-            nh3ds_log("[getlin rig] %s -> ESC", query);
-        }
     } else if (!strcmp(name, "shim_get_ext_cmd")) {
-        if (!nh3ds_debug3d) {
-            /* our own ext-command menu: top-screen list, live prefix
-             * filtering from the touch letter keyboard (the core's
-             * extcmd_via_menu() is TTY/CURSES-only) */
-            rint = nh3ds_ext_menu();
-            nh3ds_full_redraw();
-            nh3ds_log("[get_ext_cmd] -> %d", rint);
-        } else {
-            rint = -1; /* rig: cancelled */
-        }
+        /* our own ext-command menu: top-screen list, live prefix
+         * filtering from the touch letter keyboard (the core's
+         * extcmd_via_menu() is TTY/CURSES-only) */
+        rint = nh3ds_ext_menu();
+        nh3ds_full_redraw();
     } else if (!strcmp(name, "shim_number_pad")) {
         /* nothing */
     } else if (!strcmp(name, "shim_delay_output")) {
@@ -3191,7 +2573,7 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
     } else if (!strcmp(name, "shim_get_color_string")) {
         rptr = (void *) "";
     } else {
-        nh3ds_log("[UNHANDLED event] %s fmt=%s", name, fmt);
+        /* unrecognized event: nothing to do */
     }
 
     /* ---- write the return value --------------------------------------*/
@@ -3230,7 +2612,6 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
 static void
 nh3ds_cleanup(void)
 {
-    nh3ds_dump_and_close();
     /* hold-on-exit screen: keep the exit reason visible until the user
      * acknowledges it (the screen is wiped on return to the launcher) */
     nh3ds_view = NH3DS_VM_EXIT;
@@ -3276,35 +2657,6 @@ main(int argc, char *argv[])
                         "(from the zip) on the SD card?", nh3ds_hackdir);
         nh3ds_lastwords_sticky = TRUE;
     } else {
-        FILE *f;
-        /* debug aid: force the 3D slider, dump both eyes as BMPs into
-         * a ring, and let the rig autopilot hunt the down-stairs; a
-         * file containing 'L' also pins the hero to the levitation
-         * plane for a visual test of that layer */
-        nh3ds_debug3d = (access("3drig", F_OK) == 0);
-        if (nh3ds_debug3d) {
-            /* the trace log is a rig aid: an unconditional log would
-             * mean SD-card wear and clutter on every real player's
-             * card */
-            nh3ds_trace = fopen("nh3ds.log", "w");
-            if (nh3ds_trace)
-                nh3ds_log("[start] NetHack 3DS phase 4a (stereo map), "
-                          "hackdir=%s", nh3ds_hackdir);
-            f = fopen("3drig", "r");
-            if (f) {
-                char flagbuf[16];
-
-                if (fgets(flagbuf, (int) sizeof flagbuf, f)) {
-                    nh3ds_debug_lev = strchr(flagbuf, 'L') != NULL;
-                    nh3ds_debug_sweep = strchr(flagbuf, 'M') != NULL;
-                }
-                (void) fclose(f);
-            }
-            /* the rig runs in debug/wizard mode (magic mapping via ^F)
-             * without needing an OPTIONS=playmode:debug line in the
-             * config files -- those stay player-clean */
-            wizard = TRUE;
-        }
         /* CHDIR is disabled in the SHIM_GRAPHICS configuration, so
          * check_recordfile() never runs; create the variable files. */
         nh3ds_ensure_file("record");
@@ -3331,7 +2683,6 @@ main(int argc, char *argv[])
     shim_graphics_set_callback(shim_cb);
     (void) nhmain(1, nh_argv); /* moveloop() only returns at game over */
 
-    nh3ds_log("[game over] nhmain returned");
     return 0;
 }
 

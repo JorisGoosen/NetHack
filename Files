@@ -316,9 +316,8 @@ pdcurses     pdcursesmod
 
 sys/3ds:
 (files for Nintendo 3DS version)
-PLAN.md                README.3ds             README.md
-defaults.nh            icon.png               nh3ds.c
-nh3dslib.c
+README.3ds             README.md              defaults.nh
+icon.png               nh3ds.c                nh3dslib.c
 
 sys/amiga:
 (files for Amiga versions)
