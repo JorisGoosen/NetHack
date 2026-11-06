@@ -25,13 +25,15 @@ and put `DEVKITPRO` and `DEVKITARM` in the environment (e.g.
 
 The last step produces targets/3ds/nh5013ds.zip: the .3dsx plus the data
 files to install into sdmc:/3ds/nethack on the SD card (see README.3ds).
-The build flags and toolchain notes live in
+`make CROSS_TO_3DS=1 3dscia` additionally wraps the build as an
+installable Home-menu title, targets/3ds/NetHack3ds.cia; that target
+needs makerom (github.com/3DSGuy/Project_CTR) on PATH or in
+$DEVKITPRO/tools/bin, and sys/3ds/cia.rsf is its ROM spec.  The build
+flags and toolchain notes live in
 sys/unix/hints/include/cross-pre2.501 and cross-post.501.
 
 ## Not yet implemented
 
-- Message-history browsing (^P).
-- Key remapping and a runtime options UI.
-- The permanent-inventory window (OPTIONS=perm_invent is accepted, but
-  inventory always opens as a menu).
-- .cia packaging: the game runs from the Homebrew Launcher only.
+- The permanent-inventory pane (perm_invent): the core option is
+  accepted, but the bottom screen keeps the message tail and inventory
+  is always a menu away ('i', or B).

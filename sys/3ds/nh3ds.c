@@ -171,6 +171,8 @@ enum {
     NH3DS_VM_GAME = 0,  /* map + messages + status + legend */
     NH3DS_VM_MENU,      /* a buffered menu owns the top screen */
     NH3DS_VM_EXT,       /* the ext-command list owns the top screen */
+    NH3DS_VM_PREVMSG,   /* the ^P message-history browser */
+    NH3DS_VM_OPTS,      /* the front-end options screen */
     NH3DS_VM_EXIT       /* hold-on-exit screen (over the game view) */
 };
 static int nh3ds_view = NH3DS_VM_GAME;
@@ -198,8 +200,10 @@ static C2D_ImageTint nh3ds_tints[16];
 static C2D_ImageTint nh3ds_tints_dim[16]; /* 30% brightness -- the
                                            * under-the-hero glyphs */
 
-/* message ring: putstr(WIN_MESSAGE) + putmsghistory */
-#define NH3DS_NMSGS 64
+/* message ring: putstr(WIN_MESSAGE) + putmsghistory.  200 wrapped
+ * lines: the ^P (#prevmsg) browser shows the whole ring, the bottom
+ * screen keeps showing the newest tail */
+#define NH3DS_NMSGS 200
 #define NH3DS_MSGLEN 128
 static char nh3ds_msgs[NH3DS_NMSGS][NH3DS_MSGLEN];
 static int nh3ds_msg_head;      /* next free slot */
@@ -770,7 +774,7 @@ nh3ds_draw_status(void)
 static const char *const nh3ds_legend[TOP_ROWS - LEG_ROW0] = {
     "pad=hjkl 2=diag L+pad=run R+pad=travel",
     "A=rest B=inv X=grab Y=search L=shift",
-    "START=save SELECT=help touch=buttons",
+    "START=save SEL=help hold=opts touch=btns",
     "k:keys = full keyboard digits ^cmds",
 };
 
@@ -850,6 +854,99 @@ nh3ds_draw_ext(void)
     nh3ds_text(0, TOP_ROWS - 2, "A=do B=bsp START=cancel pad=move", 6);
 }
 
+/* front-end options: physical-button -> game-key remapping */
+enum { NH3DS_BT_A, NH3DS_BT_B, NH3DS_BT_X, NH3DS_BT_Y, NH3DS_BT_SELECT,
+       NH3DS_NBTNS };
+static char nh3ds_btnmap[NH3DS_NBTNS] = { '.', 'i', ',', 's', '?' };
+static const char nh3ds_btnmap_def[NH3DS_NBTNS] = { '.', 'i', ',', 's',
+                                                    '?' };
+static const char *const nh3ds_btnname[NH3DS_NBTNS] = {
+    "A", "B", "X", "Y", "SELECT",
+};
+static int nh3ds_opt_cursor;
+static int nh3ds_sel_hold;      /* frames SELECT has been held */
+#define NH3DS_OPT_HOLD 45      /* ~0.75 s at 60 fps */
+
+static void nh3ds_options_menu(void); /* defined with the input code */
+
+/* the palette a button can be mapped to (curated game keys; the
+ * d-pad, L/R and START are fixed: movement, run/travel and save) */
+static const struct { char key; const char *desc; } nh3ds_keypal[] = {
+    { '.', "rest" },       { 'i', "inventory" },  { ',', "pick up" },
+    { 's', "search" },     { '?', "help" },       { 'o', "open" },
+    { 'c', "close" },      { 'q', "quaff" },      { 'e', "eat" },
+    { 'w', "wield" },      { 'W', "wear" },       { 'T', "take off" },
+    { 'R', "remove" },     { 'd', "drop" },       { 'r', "read" },
+    { 'z', "zap" },        { 'Z', "cast spell" }, { 't', "throw" },
+    { 'f', "fire" },       { 'a', "apply" },      { '#', "loot" },
+    { 'C', "call" },       { '*', "equip" },      { ';', "look" },
+    { '>', "descend" },    { '<', "ascend" },     { 'm', "sneak" },
+    { 'S', "save" },
+};
+#define NH3DS_NPAL ((int) (sizeof nh3ds_keypal / sizeof nh3ds_keypal[0]))
+
+static const char *
+nh3ds_keydesc(char c)
+{
+    int i;
+
+    for (i = 0; i < NH3DS_NPAL; ++i)
+        if (nh3ds_keypal[i].key == c)
+            return nh3ds_keypal[i].desc;
+    return "";
+}
+
+/* ^P history browser (rows: 0 header, 1..26 lines, 28 footer) */
+static int nh3ds_pmsg_top;      /* oldest line shown (ring index) */
+
+/* the i-th oldest line of the message ring */
+static const char *
+nh3ds_msg_at(int i)
+{
+    return nh3ds_msgs[(nh3ds_msg_head - nh3ds_msg_count + i + NH3DS_NMSGS)
+                      % NH3DS_NMSGS];
+}
+
+static void
+nh3ds_draw_prevmsg(void)
+{
+    char line[TOP_COLS + 1];
+    int row, i, last;
+
+    last = nh3ds_pmsg_top + 26;
+    if (last > nh3ds_msg_count)
+        last = nh3ds_msg_count;
+    (void) snprintf(line, sizeof line, "message history %d-%d of %d",
+                    nh3ds_pmsg_top + 1, last, nh3ds_msg_count);
+    nh3ds_text(0, 0, line, 15);
+    for (row = 0; row < 26; ++row) {
+        i = nh3ds_pmsg_top + row;
+        if (i >= nh3ds_msg_count)
+            break;
+        nh3ds_text(0, row + 1, nh3ds_msg_at(i), -1);
+    }
+    nh3ds_text(0, TOP_ROWS - 2, "pad=scroll A/B=back", 6);
+}
+
+static void
+nh3ds_draw_opts(void)
+{
+    char line[TOP_COLS + 1];
+    int b;
+
+    nh3ds_text(0, 0, "3DS front-end options", 15);
+    for (b = 0; b < NH3DS_NBTNS; ++b) {
+        (void) snprintf(line, sizeof line, "%s%-6s  '%c'  %s",
+                        (b == nh3ds_opt_cursor) ? "> " : "  ",
+                        nh3ds_btnname[b], nh3ds_btnmap[b],
+                        nh3ds_keydesc(nh3ds_btnmap[b]));
+        nh3ds_text(0, b + 1, line, -1);
+    }
+    nh3ds_text(0, TOP_ROWS - 4, "pad=select A/X=change", 6);
+    nh3ds_text(0, TOP_ROWS - 3, "START=default B=save+exit", 6);
+    nh3ds_text(0, TOP_ROWS - 2, "kept in nh3ds.cfg", 6);
+}
+
 /* hold-on-exit lines, written over the (frozen) game view */
 static void
 nh3ds_draw_exit(void)
@@ -878,6 +975,12 @@ nh3ds_draw_view(float eye, float slider)
         break;
     case NH3DS_VM_EXT:
         nh3ds_draw_ext();
+        break;
+    case NH3DS_VM_PREVMSG:
+        nh3ds_draw_prevmsg();
+        break;
+    case NH3DS_VM_OPTS:
+        nh3ds_draw_opts();
         break;
     default: /* NH3DS_VM_GAME */
         nh3ds_draw_messages();
@@ -1549,18 +1652,36 @@ nh3ds_next_key(void) /* 0 = nothing to report this frame */
         repeatable = TRUE;
     } else if (!nh3ds_keys_open && btns) {
         if (btns & KEY_A)
-            key = '.', repeatable = TRUE;
+            key = nh3ds_btnmap[NH3DS_BT_A], repeatable = TRUE;
         else if (btns & KEY_B)
             /* in getpos (farlook/travel cursor mode) B is the escape */
-            key = (program_state.input_state == getposInp) ? '\033' : 'i';
+            key = (program_state.input_state == getposInp)
+                      ? '\033' : nh3ds_btnmap[NH3DS_BT_B];
         else if (btns & KEY_X)
-            key = ',';
+            key = nh3ds_btnmap[NH3DS_BT_X];
         else if (btns & KEY_Y)
-            key = 's';
+            key = nh3ds_btnmap[NH3DS_BT_Y];
         else if (btns & KEY_START)
             key = 'S';
-        else if (btns & KEY_SELECT)
-            key = '?';
+    }
+    /* SELECT: '?' on tap, the front-end options screen when held.
+     * Movement keys take priority and the keys overlay owns SELECT
+     * while it is up. */
+    if (!dir && !nh3ds_keys_open && (btns & KEY_SELECT)) {
+        if (++nh3ds_sel_hold >= NH3DS_OPT_HOLD) {
+            nh3ds_sel_hold = 0;
+            last_key = 0, last_mask = 0, frames_since = 0;
+            nh3ds_options_menu();
+            return 0;
+        }
+    } else if (nh3ds_sel_hold > 0) {
+        boolean tapped = (nh3ds_sel_hold < NH3DS_OPT_HOLD);
+
+        nh3ds_sel_hold = 0;
+        if (tapped && !nh3ds_keys_open) {
+            last_key = '?', last_mask = held, frames_since = 0;
+            return '?';
+        }
     }
     if (!dir)
         travel_armed = FALSE; /* R+dir re-arms from the start */
@@ -2055,6 +2176,159 @@ nh3ds_ext_menu(void)
     }
 }
 
+/* next/previous palette entry around c (a mapping outside the palette
+ * wraps in from the matching end) */
+static char
+nh3ds_pal_next(char c, int dir)
+{
+    int i;
+
+    for (i = 0; i < NH3DS_NPAL; ++i)
+        if (nh3ds_keypal[i].key == c)
+            break;
+    if (i == NH3DS_NPAL)
+        i = (dir > 0) ? -1 : 0;
+    i = (i + dir + NH3DS_NPAL) % NH3DS_NPAL;
+    return nh3ds_keypal[i].key;
+}
+
+static const char *const nh3ds_btnfile[NH3DS_NBTNS] = {
+    "map_a", "map_b", "map_x", "map_y", "map_select",
+};
+
+/* the front-end options file (nh3ds.cfg in the playground): the
+ * A/B/X/Y/SELECT mapping, one "map_<button>=<key>" line each */
+static void
+nh3ds_cfg_save(void)
+{
+    FILE *f = fopen("nh3ds.cfg", "w");
+    int b;
+
+    if (!f)
+        return;
+    (void) fprintf(f,
+                   "# NetHack 3DS front-end options\n"
+                   "# A/B/X/Y/SELECT -> game key; the d-pad, L/R and\n"
+                   "# START are fixed (movement, run/travel, save)\n");
+    for (b = 0; b < NH3DS_NBTNS; ++b)
+        (void) fprintf(f, "%s=%c\n", nh3ds_btnfile[b], nh3ds_btnmap[b]);
+    (void) fclose(f);
+}
+
+static void
+nh3ds_cfg_load(void)
+{
+    char buf[128];
+    FILE *f = fopen("nh3ds.cfg", "r");
+
+    if (!f)
+        return;
+    while (fgets(buf, (int) sizeof buf, f)) {
+        int b;
+
+        for (b = 0; b < NH3DS_NBTNS; ++b) {
+            size_t nl = strlen(nh3ds_btnfile[b]);
+
+            if (!strncmp(buf, nh3ds_btnfile[b], nl) && buf[nl] == '=') {
+                char c = buf[nl + 1];
+
+                if (c >= 0x20 && c < 0x7f)
+                    nh3ds_btnmap[b] = c;
+                break;
+            }
+        }
+    }
+    (void) fclose(f);
+}
+
+/* the front-end options screen: remap A/B/X/Y/SELECT; changes apply
+ * at once, B writes nh3ds.cfg and returns to the game */
+static void
+nh3ds_options_menu(void)
+{
+    nh3ds_keys_open = FALSE;
+    for (;;) {
+        u32 down;
+        int tcol, trow;
+
+        nh3ds_view = NH3DS_VM_OPTS;
+        nh3ds_render_frame();
+        down = nh3ds_menu_input(&tcol, &trow);
+        if (tcol >= 0) {
+            int r = trow - 1;
+
+            if (r >= 0 && r < NH3DS_NBTNS) /* tapped a row: cycle it */
+                nh3ds_btnmap[r] = nh3ds_pal_next(nh3ds_btnmap[r], 1);
+        } else if (down & KEY_DUP) {
+            nh3ds_opt_cursor = (nh3ds_opt_cursor + NH3DS_NBTNS - 1)
+                               % NH3DS_NBTNS;
+        } else if (down & KEY_DDOWN) {
+            nh3ds_opt_cursor = (nh3ds_opt_cursor + 1) % NH3DS_NBTNS;
+        } else if (down & KEY_A) {
+            nh3ds_btnmap[nh3ds_opt_cursor] =
+                nh3ds_pal_next(nh3ds_btnmap[nh3ds_opt_cursor], 1);
+        } else if (down & KEY_X) {
+            nh3ds_btnmap[nh3ds_opt_cursor] =
+                nh3ds_pal_next(nh3ds_btnmap[nh3ds_opt_cursor], -1);
+        } else if (down & KEY_START) {
+            memcpy(nh3ds_btnmap, nh3ds_btnmap_def, sizeof nh3ds_btnmap);
+        } else if (down & KEY_B) {
+            nh3ds_cfg_save();
+            nh3ds_full_redraw();
+            return;
+        }
+    }
+}
+
+/* ^P (#prevmsg): browse the message ring on the top screen, newest
+ * line at the bottom; the pad scrolls (left/right a page), a tap on a
+ * line scrolls it to the bottom, A/B/START returns */
+static void
+nh3ds_prevmsg_browse(void)
+{
+    int rows = 26;
+
+    if (!nh3ds_msg_count)
+        return;
+    nh3ds_pmsg_top = nh3ds_msg_count - rows;
+    if (nh3ds_pmsg_top < 0)
+        nh3ds_pmsg_top = 0;
+    for (;;) {
+        u32 down;
+        int tcol, trow;
+
+        nh3ds_view = NH3DS_VM_PREVMSG;
+        nh3ds_render_frame();
+        down = nh3ds_menu_input(&tcol, &trow);
+        if (tcol >= 0) {
+            if (trow >= 1 && trow <= rows) { /* tapped line last */
+                nh3ds_pmsg_top += trow - rows;
+                if (nh3ds_pmsg_top < 0)
+                    nh3ds_pmsg_top = 0;
+            }
+        } else if (down & (KEY_A | KEY_B | KEY_START)) {
+            break;
+        } else if (down & KEY_DUP) {
+            if (nh3ds_pmsg_top > 0)
+                --nh3ds_pmsg_top;
+        } else if (down & KEY_DDOWN) {
+            if (nh3ds_pmsg_top + rows < nh3ds_msg_count)
+                ++nh3ds_pmsg_top;
+        } else if (down & KEY_DLEFT) {
+            nh3ds_pmsg_top -= rows;
+            if (nh3ds_pmsg_top < 0)
+                nh3ds_pmsg_top = 0;
+        } else if (down & KEY_DRIGHT) {
+            nh3ds_pmsg_top += rows;
+            if (nh3ds_pmsg_top + rows > nh3ds_msg_count)
+                nh3ds_pmsg_top = nh3ds_msg_count - rows;
+            if (nh3ds_pmsg_top < 0)
+                nh3ds_pmsg_top = 0;
+        }
+    }
+    nh3ds_full_redraw();
+}
+
 /* libctru software keyboard; returns FALSE when cancelled.  The text is
  * copied into buf (truncated to fit). */
 static boolean
@@ -2392,6 +2666,7 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
     } else if (!strcmp(name, "shim_nhbell")) {
         /* nothing */
     } else if (!strcmp(name, "shim_doprev_message")) {
+        nh3ds_prevmsg_browse();
         rint = 0;
     } else if (!strcmp(name, "shim_yn_function")) {
         const char *query = args[0].s ? args[0].s : "";
@@ -2558,16 +2833,35 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
             }
         }
     } else if (!strcmp(name, "shim_update_inventory")) {
-        /* phase 2c: the shim contract says the port maintains the
-         * persistent inventory from this event; the stub ignores it */
+        /* deliberate: no permanent-inventory pane; the bottom screen
+         * keeps the message tail and inventory is a menu away ('i') --
+         * #perminv reports "not supported" (no WC_PERM_INVENT) */
     } else if (!strcmp(name, "shim_ctrl_nhwindow")) {
         rptr = (void *) 0;
     } else if (!strcmp(name, "shim_putmsghistory")) {
+        /* restore feeds the saved history oldest-first, then a null
+         * terminator; during play the core injects a few lines the
+         * same way (count prompts, quest attributions) */
         const char *msg = args[0].s;
 
-        nh3ds_msg_add(msg ? msg : "");
+        if (msg)
+            nh3ds_msg_add(msg);
     } else if (!strcmp(name, "shim_getmsghistory")) {
-        rptr = (void *) 0; /* empty message history */
+        /* save: walk the ring oldest-first, null when done */
+        static int gm_next, gm_left;
+
+        if (args[0].i) { /* init */
+            gm_next = (nh3ds_msg_head - nh3ds_msg_count + NH3DS_NMSGS)
+                      % NH3DS_NMSGS;
+            gm_left = nh3ds_msg_count;
+        }
+        if (gm_left > 0) {
+            --gm_left;
+            rptr = (void *) nh3ds_msgs[gm_next];
+            gm_next = (gm_next + 1) % NH3DS_NMSGS;
+        } else {
+            rptr = (void *) 0;
+        }
     } else if (!strcmp(name, "set_shim_font_name")) {
         rint = 0;
     } else if (!strcmp(name, "shim_get_color_string")) {
@@ -2667,6 +2961,7 @@ main(int argc, char *argv[])
          * fails and #save can never write ("Cannot open save file."), nor
          * can the automatic restore on the next boot find anything. */
         (void) mkdir("save", 0777); /* EEXIST is fine */
+        nh3ds_cfg_load();
     }
 
     (void) atexit(nh3ds_cleanup);

@@ -251,6 +251,33 @@ else
 	cd $(TARGETPFX)pkg && zip -9r ../nh$(NHV)3ds.zip *
 	@echo 3DS package zip file $(TARGETPFX)nh$(NHV)3ds.zip
 endif  # MAKEFILE_TOP
+
+# Installable Home-menu title (CIA): the same ELF wrapped by makerom
+# (sys/3ds/cia.rsf is the ROM spec).  The title needs the same
+# sdmc:/3ds/nethack data folder as the .3dsx (cf. README.3ds) and a
+# CFW console (install with FBI).  The .3dsx zip above is the primary
+# distribution and needs no extra tools.
+MAKEROM = $(firstword $(wildcard $(DEVKITPRO)/tools/bin/makerom) makerom)
+
+.PHONY: 3dscia
+ifdef MAKEFILE_TOP
+3dscia:
+	( cd src ; $(MAKE) CROSS_TO_3DS=1 3dscia )
+else
+3dscia: $(TARGETPFX)NetHack3ds.cia
+
+$(TARGETPFX)NetHack3ds.cia: $(TARGETPFX)NetHack3ds.elf \
+		$(TARGETPFX)nh3ds.smdh ../sys/3ds/cia.rsf
+	@if ! command -v $(MAKEROM) >/dev/null 2>&1; then \
+		echo "*** 3dscia needs makerom (github.com/3DSGuy/Project_CTR)," ; \
+		echo "***   on PATH or in \$\$DEVKITPRO/tools/bin" ; \
+		exit 1 ; fi
+	-rm $@
+	$(MAKEROM) -f cia -o $@ -elf $(TARGETPFX)NetHack3ds.elf \
+		-rsf ../sys/3ds/cia.rsf -target t -exefslogo \
+		-icon $(TARGETPFX)nh3ds.smdh -major 5 -minor 0 -micro 1
+	@echo 3DS cia file $(TARGETPFX)NetHack3ds.cia
+endif  # MAKEFILE_TOP
 endif  # CROSS_TO_3DS
 #
 #

@@ -10,14 +10,21 @@ Launcher can see it (e.g. sdmc:/3ds/NetHack3ds.3dsx).  The game keeps
 its data files (nhdat, sysconf, record, save files, bones, ...) in
 sdmc:/3ds/nethack, so that folder must be writable.
 
+If the package (or the build) includes NetHack3ds.cia, installing
+that with a title manager such as FBI puts NetHack in the HOME menu
+instead; it needs the same sdmc:/3ds/nethack folder and a custom
+firmware console.
+
 Play
 ----
 Launch the Homebrew Loader and start NetHack3ds.
 
 The bottom screen is the control surface: the libctru console shows
-messages and menus, the D-pad walks (hjkl), L+pad runs, A/B/X/Y are
-rest/inventory/grab/search, START saves, SELECT opens help, and touch
-brings up the button keyboard for prompts and menus.
+messages and menus, the D-pad walks (hjkl), L+pad runs, R+pad travels,
+A/B/X/Y are rest/inventory/grab/search (remappable -- hold SELECT),
+START saves, a SELECT tap opens help, and touch brings up the button
+keyboard for prompts and menus.  ^P (type it via the k:keys overlay)
+browses the full message history on the top screen.
 
 The top screen renders the map in stereoscopic 3D: push the 3DS 3D
 slider up and the level becomes a diorama -- walls sit at the glass,

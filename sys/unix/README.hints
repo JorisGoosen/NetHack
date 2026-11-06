@@ -64,6 +64,10 @@ make CROSS_TO_3DS=1           Cross-compile for a Nintendo 3DS homebrew
                               produces targets/3ds/nh5013ds.zip with the
                               .3dsx plus the files to install into
                               sdmc:/3ds/nethack on the SD card.
+                              'make CROSS_TO_3DS=1 3dscia' additionally
+                              wraps the build as an installable Home-menu
+                              title (.cia); it needs makerom (see
+                              sys/3ds/README.md).
 
 make WANT_BUNDLE=1            For macOS.501 only, place the build results into
                               a macOS bundle layout.
