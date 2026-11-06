@@ -1,4 +1,4 @@
-# NetHack for Nintendo 3DS (work in progress)
+# NetHack for Nintendo 3DS
 
 Native port of NetHack 5.0.1 to the Nintendo 3DS using devkitARM + libctru,
 cross-compiled from a Linux/macOS host through NetHack 5.0's built-in
@@ -27,3 +27,11 @@ The last step produces targets/3ds/nh5013ds.zip: the .3dsx plus the data
 files to install into sdmc:/3ds/nethack on the SD card (see README.3ds).
 The build flags and toolchain notes live in
 sys/unix/hints/include/cross-pre2.501 and cross-post.501.
+
+## Not yet implemented
+
+- Message-history browsing (^P).
+- Key remapping and a runtime options UI.
+- The permanent-inventory window (OPTIONS=perm_invent is accepted, but
+  inventory always opens as a menu).
+- .cia packaging: the game runs from the Homebrew Launcher only.
