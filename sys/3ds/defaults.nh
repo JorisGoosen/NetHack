@@ -1,4 +1,4 @@
-# NetHack 5.0.1 for Nintendo 3DS -- player configuration
+# NetHack 5.0 for Nintendo 3DS -- player configuration
 #
 # This file is installed both as "defaults.nh" and as ".nethackrc" in
 # sdmc:/3ds/nethack: on the UNIX configuration the game reads

@@ -1,8 +1,8 @@
-/* NetHack 5.0 nh3ds.c    $NHDT-Date: 1792931363 2026/10/25 13:29:23 $  $NHDT-Branch: 3ds $:$NHDT-Revision: 1.23 $ */
+/* $NHDT-Header: NetHack 5.0 nh3ds.c 2026/11/06_12:55:00 NetHack-5.0:1.1 $ */
 /* Copyright (c) the NetHack 3DS port contributors, 2026.                */
 /* NetHack may be freely redistributed.  See license for details.        */
 
-/* Nintendo 3DS front-end for NetHack 5.0.1 (libctru + shim windowport).
+/* Nintendo 3DS front-end for NetHack 5.0 (libctru + shim windowport).
  *
  * The game core never touches the 3DS: it runs through win/shim/winshim.c,
  * which forwards every windowing call to the single variadic callback
@@ -224,6 +224,7 @@ static unsigned char nh3ds_wintype[NH3DS_MAXWINID]; /* NHW_* + 1, 0 = none */
 static winid nh3ds_pop_win = -1;
 static char nh3ds_pop_lines[NH3DS_POPLINES][NH3DS_POPLINELEN];
 static int nh3ds_pop_n;
+static boolean nh3ds_pop_trunc;
 static char nh3ds_pop_prompt[NH3DS_POPLINELEN];
 
 /* one buffered menu window; items are the add_menu() stream between
@@ -244,6 +245,7 @@ static struct nh3ds_menu {
     int n;
     int top;                     /* first visible item row */
     int cursor;                  /* highlighted item (-1 = display only) */
+    boolean trunc;               /* add_menu dropped items: say so */
     struct nh3ds_menuitem item[NH3DS_MAXMENU];
     char prompt[128];
 } nh3ds_menu;
@@ -285,10 +287,10 @@ static const char *const nh3ds_st_initfmt[MAXBLSTATS] = {
     "%s",       /* BL_LEVELDESC (value: "Dlvl:1") */
     "/%s",      /* BL_EXP (follows Xp) */
     "%s",       /* BL_CONDITION (via bitmask, not text) */
-    " %s",      /* BL_VERS */
     " %s",      /* BL_WEAPON */
     " %s",      /* BL_ARMOR */
     " %s",      /* BL_TERRAIN */
+    " %s",      /* BL_VERS */
 };
 
 /* ----------------------------------------------------------------------*/
@@ -299,11 +301,10 @@ static PrintConsole nh3ds_botcon;
 static PrintConsole *nh3ds_bot;
 
 static void
-nh3ds_scr(int top) /* select the console for printf(); only the bottom
-                    * screen has one (the top screen is the citro2d
-                    * stereo viewport), so any argument is ignored */
+nh3ds_scr(void) /* select the console for printf(); only the bottom
+                 * screen has one (the top screen is the citro2d
+                 * stereo viewport) */
 {
-    (void) top;
     consoleSelect(nh3ds_bot);
 }
 
@@ -429,8 +430,6 @@ nh3ds_glyph(char chr, int clr, float px, float py, boolean dim)
 
     if (ch == ' ' || ch == '\0')
         return;
-    if (ch >= NH3DS_FONTCHARS)
-        ch = '?';
     img.tex = &nh3ds_glyph_tex;
     img.subtex = &nh3ds_glyph_sub[ch];
     (void) C2D_DrawImageAt(img, px, py, 0.5f,
@@ -828,6 +827,8 @@ nh3ds_draw_menu(void)
             (void) snprintf(line, sizeof line, "%s%s", tag, m->str);
         nh3ds_text(0, row + 1, line, nh3ds_menu_selectable(i) ? -1 : 14);
     }
+    if (nh3ds_menu.trunc)
+        nh3ds_text(0, TOP_ROWS - 3, "(list truncated)", 1);
     nh3ds_text(0, TOP_ROWS - 2, "pad=move A=ok B=cancel letter=select", 6);
 }
 
@@ -1074,7 +1075,7 @@ nh3ds_draw_popup(void)
 {
     int row = 0, i;
 
-    nh3ds_scr(0);
+    nh3ds_scr();
     printf("\x1b[2J\x1b[0m");
     if (nh3ds_pop_prompt[0]) {
         printf("\x1b[1;1H\x1b[37;1m%-40.40s", nh3ds_pop_prompt);
@@ -1106,8 +1107,14 @@ nh3ds_draw_popup(void)
                 ++s;
         }
     }
+    if (nh3ds_pop_trunc)
+        printf("\x1b[%d;1H\x1b[0m%-40.40s", BOT_ROWS - 1,
+               "(list truncated)");
     printf("\x1b[%d;1H\x1b[0m%-40.40s", BOT_ROWS, "[A] continue");
 }
+
+/* the touch letter-keyboard overlay is open (it owns the taps) */
+static boolean nh3ds_keys_open;
 
 static void nh3ds_bot_buttons(void); /* touch verb grid (defined below) */
 
@@ -1117,7 +1124,10 @@ nh3ds_draw_bot_msgs(void)
 {
     int i, n, oldest;
 
-    nh3ds_scr(0);
+    /* any core-driven bottom redraw ends the keys overlay: its pixels
+     * are gone, so its input mode must go too */
+    nh3ds_keys_open = FALSE;
+    nh3ds_scr();
     printf("\x1b[2J\x1b[0m");
     n = (nh3ds_msg_count < TBOT_MSGROWS) ? nh3ds_msg_count : TBOT_MSGROWS;
     oldest = (nh3ds_msg_head - nh3ds_msg_count + NH3DS_NMSGS) % NH3DS_NMSGS;
@@ -1127,9 +1137,6 @@ nh3ds_draw_bot_msgs(void)
                nh3ds_msgs[(oldest + i) % NH3DS_NMSGS]);
     nh3ds_bot_buttons();
 }
-
-/* the touch letter-keyboard overlay is open (it owns the taps) */
-static boolean nh3ds_keys_open;
 
 /* aptMainLoop() turns FALSE when the system wants the process gone
  * (another applet taking over now; HOME handling for a future .cia).
@@ -1183,11 +1190,11 @@ nh3ds_refresh(void)
 {
     if (nh3ds_msg_dirty) {
         /* the bottom screen is the message-history tail; redraw it in
-         * step.  (No guard for popups/menus needed: those waits are
-         * synchronous inside our own handlers, so nh_poskey -- the only
-         * refresh() caller -- cannot fire while the bottom is owned;
-         * the perm_invent window keeps a MENU winid alive forever,
-         * which would block the tail forever if we tested pop_win.) */
+         * step.  Refresh runs after each nh_poskey input read and in
+         * the synchronous display paths, so it never fires while a
+         * menu or popup owns the bottom.  (No pop_win guard: the
+         * perm_invent window keeps a MENU winid alive forever, which
+         * would block the tail forever.) */
         nh3ds_draw_bot_msgs();
     }
     if (nh3ds_map_dirty || nh3ds_msg_dirty || nh3ds_st_dirty)
@@ -1257,6 +1264,7 @@ nh3ds_display_file(const char *fname, boolean complain)
         return;
     }
     nh3ds_keys_open = FALSE; /* the popup owns the bottom now */
+    nh3ds_pop_trunc = FALSE;
     while (!stop) {
         int rows = 0;
 
@@ -1394,7 +1402,7 @@ nh3ds_bot_buttons(void)
 {
     int r, c;
 
-    nh3ds_scr(0);
+    nh3ds_scr();
     for (r = 0; r < 5; ++r)
         for (c = 0; c < 5; ++c) {
             /* the drawn block covers exactly the pressable cells: a
@@ -1435,7 +1443,7 @@ nh3ds_kbd_render(void)
 {
     int r, c, i;
 
-    nh3ds_scr(0);
+    nh3ds_scr();
     for (r = 0; r < 3; ++r)
         for (c = 0; c < 10; ++c) {
             const struct nh3ds_key *k = &nh3ds_keys[r * 10 + c];
@@ -1478,7 +1486,7 @@ nh3ds_detail(const char *s)
 {
     int row, col;
 
-    nh3ds_scr(0);
+    nh3ds_scr();
     for (row = 1; row <= 11; ++row)
         printf("\x1b[%d;1H\x1b[0m\x1b[K", row);
     row = 2;
@@ -1526,7 +1534,7 @@ nh3ds_overlay_draw(void)
 {
     int r, c, i, n, oldest;
 
-    nh3ds_scr(0);
+    nh3ds_scr();
     printf("\x1b[2J\x1b[0m");
     printf("\x1b[1;1H\x1b[36m%-40.40s",
            "L=shift R=ctrl B=close tap=key");
@@ -1832,6 +1840,7 @@ nh3ds_menu_render(int cursor)
 {
     int rows = 26;
 
+    nh3ds_keys_open = FALSE; /* the menu owns the bottom screen now */
     if (cursor >= 0) {
         if (cursor < nh3ds_menu.top)
             nh3ds_menu.top = cursor;
@@ -1843,10 +1852,10 @@ nh3ds_menu_render(int cursor)
     nh3ds_render_frame();
 
     if (cursor < 0) {
-        nh3ds_scr(0);
+        nh3ds_scr();
         printf("\x1b[2J\x1b[0m\x1b[29;1H\x1b[0m%-40.40s", "[A] continue");
     } else {
-        nh3ds_scr(0);
+        nh3ds_scr();
         printf("\x1b[2J\x1b[0m");
         nh3ds_kbd_render();
         nh3ds_detail(nh3ds_menu.item[cursor].str);
@@ -1876,6 +1885,7 @@ nh3ds_menu_input(int *tcol, int *trow)
         int tc, tr;
 
         nh3ds_apt_check();
+        gspWaitForVBlank(); /* pace the spin to the frame rate */
         if (nh3ds_tap(&tc, &tr)) {
             *tcol = tc;
             *trow = tr;
@@ -1914,9 +1924,9 @@ nh3ds_menu_pick(int how, MENU_ITEM_P **menulist)
         nh3ds_menu_render(cursor);
         down = nh3ds_menu_input(&tcol, &trow);
         if (tcol >= 0) {
-            /* touch: a key selects by accelerator (shifted via L for
-             * uppercase accelerators, items 27+), tapping a listed
-             * row moves the cursor there */
+            /* touch: a keyboard key selects by accelerator (shifted
+             * via L for uppercase accelerators, items 27+); the list
+             * itself renders on the top screen and is not touchable */
             int ch = nh3ds_kbd_map(tcol, trow);
 
             if (ch) {
@@ -1935,11 +1945,6 @@ nh3ds_menu_pick(int how, MENU_ITEM_P **menulist)
                         break;
                     }
                 }
-            } else if (trow >= 2 && trow <= 27) {
-                int j = nh3ds_menu.top + trow - 2;
-
-                if (j >= 0 && j < nh3ds_menu.n && nh3ds_menu_selectable(j))
-                    cursor = j;
             }
         } else if (down & KEY_DUP) {
             for (i = cursor - 1; i >= 0; --i)
@@ -2122,7 +2127,7 @@ nh3ds_ext_menu(void)
 
         /* bottom screen: description of the highlighted command over
          * the letter keyboard */
-        nh3ds_scr(0);
+        nh3ds_scr();
         printf("\x1b[2J\x1b[0m");
         nh3ds_detail(nh3ds_ext.nm
                          ? (extcmdlist[nh3ds_ext.match[nh3ds_ext.cursor]]
@@ -2164,10 +2169,8 @@ nh3ds_ext_menu(void)
         } else if (down & KEY_START) {
             return -1;
         } else if (down & KEY_A) {
-            if (nh3ds_ext.nm) {
-                nh3ds_full_redraw();
+            if (nh3ds_ext.nm)
                 return nh3ds_ext.match[nh3ds_ext.cursor];
-            }
         }
         if (filter_changed) { /* new filter: jump to the first match */
             nh3ds_ext.cursor = 0;
@@ -2247,6 +2250,9 @@ static void
 nh3ds_options_menu(void)
 {
     nh3ds_keys_open = FALSE;
+    nh3ds_scr();
+    printf("\x1b[2J\x1b[0m\x1b[1;1H\x1b[36m%-40.40s",
+           "front-end options: see the top screen");
     for (;;) {
         u32 down;
         int tcol, trow;
@@ -2255,10 +2261,7 @@ nh3ds_options_menu(void)
         nh3ds_render_frame();
         down = nh3ds_menu_input(&tcol, &trow);
         if (tcol >= 0) {
-            int r = trow - 1;
-
-            if (r >= 0 && r < NH3DS_NBTNS) /* tapped a row: cycle it */
-                nh3ds_btnmap[r] = nh3ds_pal_next(nh3ds_btnmap[r], 1);
+            /* the list is on the top screen; taps do nothing here */
         } else if (down & KEY_DUP) {
             nh3ds_opt_cursor = (nh3ds_opt_cursor + NH3DS_NBTNS - 1)
                                % NH3DS_NBTNS;
@@ -2293,6 +2296,9 @@ nh3ds_prevmsg_browse(void)
     nh3ds_pmsg_top = nh3ds_msg_count - rows;
     if (nh3ds_pmsg_top < 0)
         nh3ds_pmsg_top = 0;
+    nh3ds_scr();
+    printf("\x1b[2J\x1b[0m\x1b[1;1H\x1b[36m%-40.40s",
+           "message history: see the top screen");
     for (;;) {
         u32 down;
         int tcol, trow;
@@ -2301,11 +2307,7 @@ nh3ds_prevmsg_browse(void)
         nh3ds_render_frame();
         down = nh3ds_menu_input(&tcol, &trow);
         if (tcol >= 0) {
-            if (trow >= 1 && trow <= rows) { /* tapped line last */
-                nh3ds_pmsg_top += trow - rows;
-                if (nh3ds_pmsg_top < 0)
-                    nh3ds_pmsg_top = 0;
-            }
+            /* the list is on the top screen; taps do nothing here */
         } else if (down & (KEY_A | KEY_B | KEY_START)) {
             break;
         } else if (down & KEY_DUP) {
@@ -2380,6 +2382,8 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
     va_start(ap, fmt);
     for (i = 1; fmt[i] && argn < SHIM_MAXARGS; ++i) {
         char t = fmt[i];
+        if (t == 'v') /* no-argument marker: never a vararg */
+            break;
         if (t == 's' || t == 'p')
             args[argn++].p = va_arg(ap, void *);
         else
@@ -2438,6 +2442,7 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
             if (type == NHW_MENU || type == NHW_TEXT) {
                 nh3ds_pop_win = w;
                 nh3ds_pop_n = 0;
+                nh3ds_pop_trunc = FALSE;
                 nh3ds_pop_prompt[0] = '\0';
             }
         }
@@ -2510,12 +2515,16 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
 
         if (ty == NHW_MESSAGE) {
             nh3ds_msg_add(str);
-        } else if ((ty == NHW_MENU || ty == NHW_TEXT) && w == nh3ds_pop_win
-                   && nh3ds_pop_n < NH3DS_POPLINES) {
-            strncpy(nh3ds_pop_lines[nh3ds_pop_n], str,
-                    NH3DS_POPLINELEN - 1);
-            nh3ds_pop_lines[nh3ds_pop_n][NH3DS_POPLINELEN - 1] = '\0';
-            ++nh3ds_pop_n;
+        } else if ((ty == NHW_MENU || ty == NHW_TEXT)
+                   && w == nh3ds_pop_win) {
+            if (nh3ds_pop_n < NH3DS_POPLINES) {
+                strncpy(nh3ds_pop_lines[nh3ds_pop_n], str,
+                        NH3DS_POPLINELEN - 1);
+                nh3ds_pop_lines[nh3ds_pop_n][NH3DS_POPLINELEN - 1] = '\0';
+                ++nh3ds_pop_n;
+            } else {
+                nh3ds_pop_trunc = TRUE;
+            }
         }
     } else if (!strcmp(name, "shim_display_file")) {
         nh3ds_display_file(args[0].s ? args[0].s : "", args[1].i != 0);
@@ -2528,6 +2537,7 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
             nh3ds_menu.active = TRUE;
             nh3ds_menu.n = 0;
             nh3ds_menu.top = 0;
+            nh3ds_menu.trunc = FALSE;
             nh3ds_menu.prompt[0] = '\0';
         }
     } else if (!strcmp(name, "shim_add_menu")) {
@@ -2538,20 +2548,23 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
         char ch = (char) args[3].i;
         const char *str = args[7].s ? args[7].s : "";
 
-        if (nh3ds_menu.active && w == nh3ds_menu.win
-            && nh3ds_menu.n < NH3DS_MAXMENU) {
-            struct nh3ds_menuitem *m = &nh3ds_menu.item[nh3ds_menu.n];
+        if (nh3ds_menu.active && w == nh3ds_menu.win) {
+            if (nh3ds_menu.n < NH3DS_MAXMENU) {
+                struct nh3ds_menuitem *m = &nh3ds_menu.item[nh3ds_menu.n];
 
-            m->id = *(const ANY_P *) (const void *) (uintptr_t)
-                        args[2].i;
-            m->ch = ch;
-            m->gch = (char) args[4].i;
-            m->attr = args[5].i;
-            m->clr = args[6].i;
-            (void) strncpy(m->str, str, sizeof m->str - 1);
-            m->str[sizeof m->str - 1] = '\0';
-            m->itemflags = (unsigned) args[8].i;
-            ++nh3ds_menu.n;
+                m->id = *(const ANY_P *) (const void *) (uintptr_t)
+                            args[2].i;
+                m->ch = ch;
+                m->gch = (char) args[4].i;
+                m->attr = args[5].i;
+                m->clr = args[6].i;
+                (void) strncpy(m->str, str, sizeof m->str - 1);
+                m->str[sizeof m->str - 1] = '\0';
+                m->itemflags = (unsigned) args[8].i;
+                ++nh3ds_menu.n;
+            } else {
+                nh3ds_menu.trunc = TRUE;
+            }
         }
     } else if (!strcmp(name, "shim_end_menu")) {
         const char *prompt = args[1].s;
@@ -2622,8 +2635,9 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
             cell = &nh3ds_map[y][x];
             bg = &nh3ds_mapbg[y][x];
             un = &nh3ds_mapunder[y][x];
-            clr = (signed char) (gip->gm.sym.color <= 0 ? -1
-                                                        : gip->gm.sym.color);
+            /* < 0, not <= 0: CLR_BLACK is a real color */
+            clr = (signed char) (gip->gm.sym.color < 0
+                                    ? -1 : gip->gm.sym.color);
             /* keep the last non-hero foreground glyph per cell: on the
              * hero's tile it is what the hero stands on */
             if (!(gip->gm.glyphflags & MG_HERO)) {
@@ -2638,8 +2652,8 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
             cell->gflags = gip->gm.glyphflags;
             if (bgip) {
                 bg->c = (char) bgip->ttychar;
-                bg->color = (signed char) (bgip->gm.sym.color <= 0
-                                               ? -1 : bgip->gm.sym.color);
+                bg->color = (signed char) (bgip->gm.sym.color < 0
+                                              ? -1 : bgip->gm.sym.color);
                 bg->glyph = bgip->glyph;
                 bg->gflags = bgip->gm.glyphflags;
             }
@@ -2679,7 +2693,7 @@ shim_cb(const char *name, void *ret_ptr, const char *fmt, ...)
          * physical buttons shortcut the common cases (A = default,
          * B = no/escape, Y = yes, X = quit-choice) */
         nh3ds_keys_open = FALSE;
-        nh3ds_scr(0);
+        nh3ds_scr();
         printf("\x1b[2J\x1b[0m");
         nh3ds_detail(query);
         nh3ds_kbd_render();
@@ -2941,7 +2955,7 @@ main(int argc, char *argv[])
     nh3ds_bot = consoleInit(GFX_BOTTOM, &nh3ds_botcon);
     nh3ds_gpu_init();
     nh3ds_st_init();
-    nh3ds_scr(0);
+    nh3ds_scr();
     printf("\x1b[2J\x1b[0m\x1b[1;1HNetHack 3DS booting...\x1b[0m");
 
     if (chdir(nh3ds_hackdir) < 0) {

@@ -275,7 +275,7 @@ $(TARGETPFX)NetHack3ds.cia: $(TARGETPFX)NetHack3ds.elf \
 	-rm $@
 	$(MAKEROM) -f cia -o $@ -elf $(TARGETPFX)NetHack3ds.elf \
 		-rsf ../sys/3ds/cia.rsf -target t -exefslogo \
-		-icon $(TARGETPFX)nh3ds.smdh -major 5 -minor 0 -micro 1
+		-icon $(TARGETPFX)nh3ds.smdh -major 5 -minor 0
 	@echo 3DS cia file $(TARGETPFX)NetHack3ds.cia
 endif  # MAKEFILE_TOP
 endif  # CROSS_TO_3DS

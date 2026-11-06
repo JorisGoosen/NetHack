@@ -1,5 +1,5 @@
-NetHack 5.0.1 for Nintendo 3DS
-==============================
+NetHack 5.0 for Nintendo 3DS
+============================
 
 Install
 -------
@@ -22,9 +22,9 @@ Launch the Homebrew Loader and start NetHack3ds.
 The bottom screen is the control surface: the libctru console shows
 messages and menus, the D-pad walks (hjkl), L+pad runs, R+pad travels,
 A/B/X/Y are rest/inventory/grab/search (remappable -- hold SELECT),
-START saves, a SELECT tap opens help, and touch brings up the button
-keyboard for prompts and menus.  ^P (type it via the k:keys overlay)
-browses the full message history on the top screen.
+START saves, a SELECT tap opens help, and the touch screen presses the
+verb buttons (the k:keys verb opens the full keyboard for prompts and
+menus).  ^P browses the full message history on the top screen.
 
 The top screen renders the map in stereoscopic 3D: push the 3DS 3D
 slider up and the level becomes a diorama -- walls sit at the glass,

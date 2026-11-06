@@ -1,4 +1,4 @@
-/* NetHack 5.0 nh3dslib.c    $NHDT-Date: 1792931241 2026/10/25 13:27:21 $  $NHDT-Branch: 3ds $:$NHDT-Revision: 1.1 $ */
+/* $NHDT-Header: NetHack 5.0 nh3dslib.c 2026/11/06_12:55:00 NetHack-5.0:1.1 $ */
 /* Copyright (c) the NetHack 3DS port contributors, 2026.                */
 /* NetHack may be freely redistributed.  See license for details.        */
 

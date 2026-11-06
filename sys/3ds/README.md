@@ -1,6 +1,6 @@
 # NetHack for Nintendo 3DS
 
-Native port of NetHack 5.0.1 to the Nintendo 3DS using devkitARM + libctru,
+Native port of NetHack 5.0 to the Nintendo 3DS using devkitARM + libctru,
 cross-compiled from a Linux/macOS host through NetHack 5.0's built-in
 cross-compile framework (`CROSS_TO_3DS`).
 
